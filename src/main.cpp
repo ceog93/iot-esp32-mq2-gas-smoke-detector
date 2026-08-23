@@ -44,7 +44,7 @@ void indicarConexionExitosa();
 void indicarErrorConexion();
 bool enviarMensajeTelegram(String mensaje);
 String urlEncode(String str);
-void verificarEstabilizacion(int valorActual);
+  void verificarEstabilizacion(int valorActual);
 void activarBuzzerAlarma();
 
 void setup() {
@@ -313,12 +313,48 @@ bool enviarMensajeTelegram(String mensaje) {
 // ==========================================
 // FUNCIÓN PARA ACTIVAR EL BUZZER LOCAL
 // ==========================================
-void activarBuzzerAlarma() {
+void activarBuzzerAlarma_1() {
+  //Patrón de tres tonos cortos y agudos (alerta rápida)
   for (int i = 0; i < 3; i++) {
     digitalWrite(PIN_BUZZER, LOW);  // Encender buzzer (LOW para módulos activos en bajo)
     delay(100);
     digitalWrite(PIN_BUZZER, HIGH); // Apagar buzzer (HIGH)
     delay(100);
+  }
+}
+
+// ==========================================
+// FUNCIÓN PARA ACTIVAR EL BUZZER LOCAL (Sirena de Emergencia)
+// ==========================================
+void activarBuzzerAlarma_2() {
+  // Patrón de alerta tipo despertador (5 pulsos rápidos y estridentes)
+  for (int i = 0; i < 5; i++) {
+    digitalWrite(PIN_BUZZER, LOW);  // Encender buzzer
+    delay(80);                      // Pulso corto
+    digitalWrite(PIN_BUZZER, HIGH); // Apagar buzzer
+    delay(80);
+  }
+  delay(200); // Breve pausa entre ráfagas de sirena
+}
+
+// ==========================================
+// FUNCIÓN PARA ACTIVAR EL BUZZER LOCAL (Patrón Sirena de Patrulla)
+// ==========================================
+void activarBuzzerAlarma() {
+  // Ráfaga rápida 1 (como alerta inicial)
+  for (int i = 0; i < 4; i++) {
+    digitalWrite(PIN_BUZZER, LOW);  // Encender buzzer
+    delay(60);                      // Pulso muy rápido
+    digitalWrite(PIN_BUZZER, HIGH); // Apagar buzzer
+    delay(60);
+  }
+  
+  // Ráfaga lenta 2 (simulando el cambio de tono de sirena)
+  for (int i = 0; i < 2; i++) {
+    digitalWrite(PIN_BUZZER, LOW);  // Encender buzzer
+    delay(200);                     // Pulso largo
+    digitalWrite(PIN_BUZZER, HIGH); // Apagar buzzer
+    delay(150);
   }
 }
 
