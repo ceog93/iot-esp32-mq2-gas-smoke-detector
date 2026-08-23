@@ -8,7 +8,8 @@
 // ==========================================
 const int PIN_LED_BUILDIN = 2;          // Pin del LED integrado en la placa ESP32
 const int PIN_SENSOR_GAS = 34;          // Pin analógico (GPIO 34) conectado a la salida AO del MQ-2
-
+const int PIN_BUZZER = 25;              // Pin digital (GPIO 25) conectado al Buzzer local
+// Nota el buzzer está alimentado a 3.3V 
 // ==========================================
 // UMBRALES Y CONFIGURACIÓN DE ALERTAS
 // ==========================================
@@ -44,6 +45,7 @@ void indicarErrorConexion();
 bool enviarMensajeTelegram(String mensaje);
 String urlEncode(String str);
 void verificarEstabilizacion(int valorActual);
+void activarBuzzerAlarma();
 
 void setup() {
   // Inicializar comunicación serial para depuración a 115200 baudios
@@ -54,6 +56,10 @@ void setup() {
   pinMode(PIN_LED_BUILDIN, OUTPUT);
   digitalWrite(PIN_LED_BUILDIN, LOW);
   pinMode(PIN_SENSOR_GAS, INPUT);
+  
+  // Configuración del pin del Buzzer como salida y asegurarlo apagado (HIGH para módulos activos en LOW)
+  pinMode(PIN_BUZZER, OUTPUT);
+  digitalWrite(PIN_BUZZER, HIGH);
 
   Serial.println("\n==========================================");
   Serial.println("   INICIANDO CONEXIÓN WI-FI + TELEGRAM    ");
@@ -139,6 +145,7 @@ void loop() {
     if (!sensorEstabilizado) {
       Serial.print(" [Calentando/Estabilizando...]");
       verificarEstabilizacion(valorCrudo);
+      digitalWrite(PIN_BUZZER, HIGH); // Mantener el buzzer apagado (HIGH) durante el arranque
     } 
     // Si ya está listo, pasamos a vigilar activamente la presencia de gas/humo
     else {
@@ -146,6 +153,10 @@ void loop() {
       
       // Evaluar si superamos el umbral de peligro configurado
       if (valorCrudo > UMBRAL_GAS) {
+        
+        // Activar sirena local de inmediato por hardware
+        activarBuzzerAlarma();
+
         // Verificar si ya transcurrió el tiempo de cooldown para evitar saturar Telegram
         if (millis() - ultimoEnvioTelegram > COOLDOWN_TELEGRAM) {
           Serial.println("\n[!] ¡Nivel de gas elevado detectado! Enviando alerta...");
@@ -157,6 +168,8 @@ void loop() {
         } else {
           Serial.println(" (En periodo de cooldown, alerta silenciada temporalmente)");
         }
+      } else {
+        digitalWrite(PIN_BUZZER, HIGH); // Asegurar buzzer apagado (HIGH) si los niveles son normales
       }
     }
     Serial.println("");
@@ -165,6 +178,14 @@ void loop() {
   } 
   // 4. Si NO hay Wi-Fi, ejecutar rutina de reconexión en segundo plano y parpadeo de error
   else {
+    // Si no hay red pero el sensor detecta gas, la sirena local debe sonar de todos modos
+    int valorCrudo = analogRead(PIN_SENSOR_GAS);
+    if (valorCrudo > UMBRAL_GAS) {
+      activarBuzzerAlarma();
+    } else {
+      digitalWrite(PIN_BUZZER, HIGH);
+    }
+
     WiFi.reconnect();
     indicarErrorConexion();
   }
@@ -287,6 +308,18 @@ bool enviarMensajeTelegram(String mensaje) {
   
   Serial.println("[Telegram] Error persistente al enviar el mensaje tras 3 intentos.");
   return false;
+}
+
+// ==========================================
+// FUNCIÓN PARA ACTIVAR EL BUZZER LOCAL
+// ==========================================
+void activarBuzzerAlarma() {
+  for (int i = 0; i < 3; i++) {
+    digitalWrite(PIN_BUZZER, LOW);  // Encender buzzer (LOW para módulos activos en bajo)
+    delay(100);
+    digitalWrite(PIN_BUZZER, HIGH); // Apagar buzzer (HIGH)
+    delay(100);
+  }
 }
 
 // ==========================================
