@@ -3,32 +3,42 @@
 #include <WiFiClientSecure.h>
 #include "secrets.h"
 
-// Pin del LED integrado
-const int PIN_LED_BUILDIN = 2;
+// ==========================================
+// CONFIGURACIÓN DE PINES Y CONSTANTES
+// ==========================================
+const int PIN_LED_BUILDIN = 2;          // Pin del LED integrado en la placa ESP32
+const int PIN_SENSOR_GAS = 34;          // Pin analógico (GPIO 34) conectado a la salida AO del MQ-2
 
-// Pin del sensor MQ-2 (Salida Analógica AO)
-const int PIN_SENSOR_GAS = 34;
+// ==========================================
+// UMBRALES Y CONFIGURACIÓN DE ALERTAS
+// ==========================================
+// Umbral de gas en valor crudo del ADC (0 - 4095). 
+// Ajustado a 1500 asumiendo que tu aire limpio ronda los ~960.
+const int UMBRAL_GAS = 1500; 
 
-// Umbral de gas/humo para alerta
-const int UMBRAL_GAS = 2000; 
-
-// Control de tiempo para evitar spam en Telegram (Cooldown)
+// Control de tiempo para evitar spam en Telegram (Cooldown en milisegundos)
 unsigned long ultimoEnvioTelegram = 0;
-const unsigned long COOLDOWN_TELEGRAM = 30000; // 30 segundos
+const unsigned long COOLDOWN_TELEGRAM = 30000; // 30 segundos de espera mínima entre alertas repetidas
 
-// Variables para la detección de estabilización automática
-bool sensorEstabilizado = false;
-int ultimasLecturas[10]; // Guardamos las últimas 10 lecturas
-int indiceLectura = 0;
-bool arregloLleno = false;
-unsigned long tiempoInicioEstabilizacion = 0;
+// ==========================================
+// VARIABLES PARA ESTABILIZACIÓN AUTOMÁTICA
+// ==========================================
+bool sensorEstabilizado = false;         // Bandera para saber si el sensor ya superó el calentamiento
+int ultimasLecturas[10];                // Arreglo para guardar una ventana deslizante de las últimas 10 lecturas
+int indiceLectura = 0;                  // Índice actual dentro del arreglo circular
+bool arregloLleno = false;              // Indica si ya recolectamos suficientes datos para empezar a evaluar
+unsigned long tiempoInicioEstabilizacion = 0; // Cronómetro para medir cuánto tardó en estabilizarse
 
-// Parámetros de conexión
-const int MAX_INTENTOS_WIFI = 25;
-bool wifiConectado = false;
-bool estadoPrevioWiFI = false;
+// ==========================================
+// PARÁMETROS DE CONEXIÓN WI-FI
+// ==========================================
+const int MAX_INTENTOS_WIFI = 25;       // Número máximo de intentos antes de dar error de conexión
+bool wifiConectado = false;             // Estado actual de la red
+bool estadoPrevioWiFI = false;          // Memoria del estado anterior para detectar caídas/recuperaciones
 
-// Prototipos de funciones
+// ==========================================
+// PROTOTIPOS DE FUNCIONES
+// ==========================================
 void indicarConexionExitosa();
 void indicarErrorConexion();
 bool enviarMensajeTelegram(String mensaje);
@@ -36,9 +46,11 @@ String urlEncode(String str);
 void verificarEstabilizacion(int valorActual);
 
 void setup() {
+  // Inicializar comunicación serial para depuración a 115200 baudios
   Serial.begin(115200);
   delay(1000);
 
+  // Configuración de pines físicos
   pinMode(PIN_LED_BUILDIN, OUTPUT);
   digitalWrite(PIN_LED_BUILDIN, LOW);
   pinMode(PIN_SENSOR_GAS, INPUT);
@@ -48,11 +60,12 @@ void setup() {
   Serial.println("==========================================");
   Serial.printf("Conectando a la red: %s\n", SECRET_WIFI_SSID);
 
+  // Configurar el ESP32 en modo estación (conecta a router Wi-Fi)
   WiFi.mode(WIFI_STA);
   WiFi.begin(SECRET_WIFI_SSID, SECRET_WIFI_PASS);
 
   int intentos = 0;
-  // Parpadeo rápido mientras intenta conectar
+  // Bucle de espera activa con parpadeo rápido en el LED mientras conecta al Wi-Fi
   while (WiFi.status() != WL_CONNECTED && intentos < MAX_INTENTOS_WIFI) {
     digitalWrite(PIN_LED_BUILDIN, HIGH);
     delay(100);
@@ -65,6 +78,7 @@ void setup() {
 
   Serial.println("");
 
+  // Verificar si la conexión fue exitosa
   if (WiFi.status() == WL_CONNECTED) {
     wifiConectado = true;
     estadoPrevioWiFI = true;
@@ -74,13 +88,16 @@ void setup() {
     Serial.println(WiFi.localIP());
     Serial.printf("    Calidad señal (RSSI): %d dBm\n", WiFi.RSSI());
 
-    // 3 destellos rápidos de confirmación
+    // 3 destellos rápidos de confirmación visual
     indicarConexionExitosa();
     
-    // Apagar el LED definitivamente
+    // Apagar el LED definitivamente tras la conexión exitosa
     digitalWrite(PIN_LED_BUILDIN, LOW);
 
+    // Notificar al usuario vía Telegram que el sistema arrancó
     enviarMensajeTelegram("🟢 *ESP32 Conectado*\nEl sistema se ha iniciado. Esperando a que el sensor MQ-2 se estabilice...");
+    
+    // Iniciar cronómetro de estabilización
     tiempoInicioEstabilizacion = millis();
   } else {
     wifiConectado = false;
@@ -93,13 +110,13 @@ void setup() {
 void loop() {
   bool estadoActualWiFi = (WiFi.status() == WL_CONNECTED);
 
-  // Detectar si hubo un cambio de estado (transición de conectado a desconectado)
+  // 1. Detectar si hubo una pérdida repentina de conexión Wi-Fi
   if (estadoPrevioWiFI && !estadoActualWiFi) {
     Serial.println("[!] ¡Alerta! Conexión Wi-Fi perdida.");
     wifiConectado = false;
     estadoPrevioWiFI = false;
   } 
-  // Detectar si se recuperó la conexión
+  // 2. Detectar si se recuperó la conexión Wi-Fi previamente caída
   else if (!estadoPrevioWiFI && estadoActualWiFi) {
     Serial.println("[+] ¡Conexión Wi-Fi recuperada!");
     wifiConectado = true;
@@ -109,77 +126,104 @@ void loop() {
     enviarMensajeTelegram("🟢 *ESP32 Reconectado*\nLa conexión Wi-Fi se ha restablecido.");
   }
 
-  // Si hay Wi-Fi, ejecutamos la lectura del sensor y lógica de alertas
+  // 3. Operación principal si hay red Wi-Fi disponible
   if (wifiConectado) {
+    // Lectura analógica en crudo del sensor (0 a 4095)
     int valorCrudo = analogRead(PIN_SENSOR_GAS);
+    // Conversión matemática opcional para estimar el voltaje en el pin AO
     float voltaje = valorCrudo * (3.3 / 4095.0);
 
     Serial.printf("[Sensor MQ-2] Crudo: %d  |  Voltaje: %.2f V", valorCrudo, voltaje);
 
-    // Si aún no se declara estabilizado, evaluamos su comportamiento
+    // Bifurcación: Si el sensor aún no está listo, evaluamos su calentamiento
     if (!sensorEstabilizado) {
       Serial.print(" [Calentando/Estabilizando...]");
       verificarEstabilizacion(valorCrudo);
-    } else {
+    } 
+    // Si ya está listo, pasamos a vigilar activamente la presencia de gas/humo
+    else {
       Serial.print(" [Sensor Listo ✅]");
       
-      // Evaluar presencia de gas solo si ya está listo
+      // Evaluar si superamos el umbral de peligro configurado
       if (valorCrudo > UMBRAL_GAS) {
+        // Verificar si ya transcurrió el tiempo de cooldown para evitar saturar Telegram
         if (millis() - ultimoEnvioTelegram > COOLDOWN_TELEGRAM) {
           Serial.println("\n[!] ¡Nivel de gas elevado detectado! Enviando alerta...");
           bool enviado = enviarMensajeTelegram("🚨 *¡ALERTA DE GAS/HUMO!* \nSe ha detectado una concentración elevada de gas en el ambiente.");
+          
           if (enviado) {
-            ultimoEnvioTelegram = millis();
+            ultimoEnvioTelegram = millis(); // Actualizar marca de tiempo del último envío exitoso
           }
+        } else {
+          Serial.println(" (En periodo de cooldown, alerta silenciada temporalmente)");
         }
       }
     }
     Serial.println("");
 
-    delay(2000); 
+    delay(2000); // Pausa de 2 segundos entre cada ciclo de lectura
   } 
-  // Si NO hay Wi-Fi, activamos el protocolo de reconexión y parpadeo de error
+  // 4. Si NO hay Wi-Fi, ejecutar rutina de reconexión en segundo plano y parpadeo de error
   else {
     WiFi.reconnect();
     indicarErrorConexion();
   }
 }
 
-// Función que analiza si las últimas lecturas son estables
+// ==========================================
+// FUNCIÓN DE ESTABILIZACIÓN AUTOMÁTICA
+// ==========================================
 void verificarEstabilizacion(int valorActual) {
+  // Almacenar lectura actual en el arreglo circular
   ultimasLecturas[indiceLectura] = valorActual;
   indiceLectura = (indiceLectura + 1) % 10;
 
   if (indiceLectura == 0) {
-    arregloLleno = true;
+    arregloLleno = true; // Marcamos que ya tenemos una ronda completa de 10 muestras (20 segundos)
   }
 
-  // Solo empezamos a evaluar cuando ya llenamos al menos una ronda de 10 lecturas (20 segundos)
+  // Analizar únicamente cuando el buffer circular esté completamente lleno
   if (arregloLleno) {
     int minVal = ultimasLecturas[0];
     int maxVal = ultimasLecturas[0];
 
+    // Buscar el valor mínimo y máximo dentro de las últimas 10 mediciones
     for (int i = 1; i < 10; i++) {
       if (ultimasLecturas[i] < minVal) minVal = ultimasLecturas[i];
       if (ultimasLecturas[i] > maxVal) maxVal = ultimasLecturas[i];
     }
 
-    int delta = maxVal - minVal;
+    int delta = maxVal - minVal; // Calcular la fluctuación máxima (delta)
     Serial.printf(" (Variación en 20s: %d)", delta);
 
-    // Si la diferencia máxima entre las últimas 10 lecturas es menor o igual a 8 puntos, considéralo estable
-    if (delta <= 8) {
+    // =========================================================================
+    // SELECCIÓN DE TOLERANCIA DE ESTABILIZACIÓN:
+    // =========================================================================
+    // OPCIÓN A (PRODUCCIÓN / ALTA PRECISIÓN): 
+    // delta <= 8 -> Exige una curva muy plana (tarda más en arrancar, ~15-20 min).
+    // -------------------------------------------------------------------------
+    // OPCIÓN B (PRUEBAS / MODO RÁPIDO): 
+    // delta <= 15 -> Tolera mayor fluctuación (arranca en pocos minutos).
+    // =========================================================================
+    
+    int toleranciaEstabilidad = 15; // Cambiar a 8 cuando pase a PRODUCCIÓN
+    
+    if (delta <= toleranciaEstabilidad) {
       sensorEstabilizado = true;
-      unsigned long tiempoTotalMinutos = (millis() - tiempoInicioEstabilizacion) / 60000;
-      Serial.println("\n[+] ¡Sensor MQ-2 estabilizado con éxito!");
+      unsigned long tiempoTotalSegundos = (millis() - tiempoInicioEstabilizacion) / 1000;
+      Serial.println("\n[+] ¡Sensor MQ-2 estabilizado con éxito (modo rápido)!");
       
-      String msg = "✅ *Sensor MQ-2 Estabilizado*\nEl sensor ha alcanzado su temperatura óptima de operación.\nValor base de aire limpio: " + String(valorActual) + "\nTiempo transcurrido: ~" + String(tiempoTotalMinutos) + " minutos.";
+      // Construir y enviar mensaje de confirmación a Telegram
+      String msg = "✅ *Sensor MQ-2 Estabilizado*\nCalibración rápida completada.\nValor base de aire limpio: " + String(valorActual) + "\nTiempo transcurrido: " + String(tiempoTotalSegundos) + " segundos.";
       enviarMensajeTelegram(msg);
     }
   }
 }
 
-// Función auxiliar para formatear caracteres especiales en la URL
+// ==========================================
+// FUNCIÓN AUXILIAR: URL ENCODE
+// ==========================================
+// Permite formatear caracteres especiales (espacios, tildes, símbolos) para enviarlos por URL HTTP GET
 String urlEncode(String str) {
   String encodedString = "";
   char c;
@@ -203,40 +247,51 @@ String urlEncode(String str) {
   return encodedString;
 }
 
-// Función para enviar mensajes a Telegram vía HTTPS
+// ==========================================
+// FUNCIÓN DE ENVÍO A TELEGRAM VÍA HTTPS (Con Reintentos)
+// ==========================================
 bool enviarMensajeTelegram(String mensaje) {
   if (WiFi.status() != WL_CONNECTED) return false;
 
-  WiFiClientSecure client;
-  client.setInsecure();
-
   String url = "/bot" + String(SECRET_BOT_TOKEN) + "/sendMessage?chat_id=" + String(SECRET_CHAT_ID) + "&text=" + urlEncode(mensaje) + "&parse_mode=Markdown";
 
-  Serial.println("[Telegram] Enviando mensaje...");
-  
-  if (client.connect("api.telegram.org", 443)) {
-    client.print(String("GET ") + url + " HTTP/1.1\r\n" +
-                 "Host: api.telegram.org\r\n" +
-                 "Connection: close\r\n\r\n");
+  // Intentar hasta 3 veces en caso de fallo de red intermitente
+  for (int intento = 1; intento <= 3; intento++) {
+    Serial.printf("[Telegram] Intentando enviar mensaje (Intento %d/3)...\n", intento);
     
-    unsigned long timeout = millis();
-    while (client.connected() && millis() - timeout < 5000) {
-      if (client.available()) {
-        String line = client.readStringUntil('\n');
-        if (line.startsWith("HTTP/1.1 200 OK")) {
-          Serial.println("[Telegram] ¡Mensaje enviado con éxito!");
-          client.stop();
-          return true;
+    WiFiClientSecure client;
+    client.setInsecure(); // Omitir validación estricta de certificados SSL
+
+    if (client.connect("api.telegram.org", 443)) {
+      client.print(String("GET ") + url + " HTTP/1.1\r\n" +
+                   "Host: api.telegram.org\r\n" +
+                   "Connection: close\r\n\r\n");
+      
+      unsigned long timeout = millis();
+      while (client.connected() && millis() - timeout < 5000) {
+        if (client.available()) {
+          String line = client.readStringUntil('\n');
+          if (line.startsWith("HTTP/1.1 200 OK")) {
+            Serial.println("[Telegram] ¡Mensaje enviado con éxito!");
+            client.stop();
+            return true; // Éxito, salimos de la función
+          }
         }
       }
+      client.stop();
     }
-    client.stop();
+    
+    // Pequeña pausa antes de reintentar
+    delay(1000);
   }
   
-  Serial.println("[Telegram] Error al enviar el mensaje.");
+  Serial.println("[Telegram] Error persistente al enviar el mensaje tras 3 intentos.");
   return false;
 }
 
+// ==========================================
+// FUNCIONES DE INDICADORES VISUALES (LED)
+// ==========================================
 void indicarConexionExitosa() {
   for (int i = 0; i < 3; i++) {
     digitalWrite(PIN_LED_BUILDIN, HIGH);
