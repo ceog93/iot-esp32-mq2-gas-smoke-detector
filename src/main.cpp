@@ -9,6 +9,7 @@
 const int PIN_LED_BUILDIN = 2;          // Pin del LED integrado en la placa ESP32
 const int PIN_SENSOR_GAS = 34;          // Pin analógico (GPIO 34) conectado a la salida AO del MQ-2
 const int PIN_BUZZER = 25;              // Pin digital (GPIO 25) conectado al Buzzer local
+const int PIN_RELE = 26;                // Pin digital (GPIO 26) conectado al Módulo Relé de 5V (3 pines)
 // Nota el buzzer está alimentado a 3.3V 
 // ==========================================
 // UMBRALES Y CONFIGURACIÓN DE ALERTAS
@@ -44,7 +45,7 @@ void indicarConexionExitosa();
 void indicarErrorConexion();
 bool enviarMensajeTelegram(String mensaje);
 String urlEncode(String str);
-  void verificarEstabilizacion(int valorActual);
+void verificarEstabilizacion(int valorActual);
 void activarBuzzerAlarma();
 
 void setup() {
@@ -60,6 +61,10 @@ void setup() {
   // Configuración del pin del Buzzer como salida y asegurarlo apagado (HIGH para módulos activos en LOW)
   pinMode(PIN_BUZZER, OUTPUT);
   digitalWrite(PIN_BUZZER, HIGH);
+
+  // TRUCO PARA EL RELÉ DE 5V: En lugar de mandar HIGH (3.3V), 
+  // lo configuramos como INPUT (Alta Impedancia) para cortar la fuga de corriente y apagarlo de verdad en reposo.
+  pinMode(PIN_RELE, INPUT);
 
   Serial.println("\n==========================================");
   Serial.println("   INICIANDO CONEXIÓN WI-FI + TELEGRAM    ");
@@ -146,6 +151,7 @@ void loop() {
       Serial.print(" [Calentando/Estabilizando...]");
       verificarEstabilizacion(valorCrudo);
       digitalWrite(PIN_BUZZER, HIGH); // Mantener el buzzer apagado (HIGH) durante el arranque
+      pinMode(PIN_RELE, INPUT);       // Mantener relé en alta impedancia (apagado) durante el arranque
     } 
     // Si ya está listo, pasamos a vigilar activamente la presencia de gas/humo
     else {
@@ -154,6 +160,10 @@ void loop() {
       // Evaluar si superamos el umbral de peligro configurado
       if (valorCrudo > UMBRAL_GAS) {
         
+        // Activar relé INMEDIATAMENTE cambiando a OUTPUT y mandando señal LOW
+        pinMode(PIN_RELE, OUTPUT);
+        digitalWrite(PIN_RELE, LOW);
+
         // Activar sirena local de inmediato por hardware
         activarBuzzerAlarma();
 
@@ -170,6 +180,7 @@ void loop() {
         }
       } else {
         digitalWrite(PIN_BUZZER, HIGH); // Asegurar buzzer apagado (HIGH) si los niveles son normales
+        pinMode(PIN_RELE, INPUT);       // Forzar apagado real del relé pasándolo a Alta Impedancia
       }
     }
     Serial.println("");
@@ -178,12 +189,15 @@ void loop() {
   } 
   // 4. Si NO hay Wi-Fi, ejecutar rutina de reconexión en segundo plano y parpadeo de error
   else {
-    // Si no hay red pero el sensor detecta gas, la sirena local debe sonar de todos modos
+    // Si no hay red pero el sensor detecta gas, la sirena local y el relé deben actuar de todos modos
     int valorCrudo = analogRead(PIN_SENSOR_GAS);
     if (valorCrudo > UMBRAL_GAS) {
+      pinMode(PIN_RELE, OUTPUT);
+      digitalWrite(PIN_RELE, LOW);
       activarBuzzerAlarma();
     } else {
       digitalWrite(PIN_BUZZER, HIGH);
+      pinMode(PIN_RELE, INPUT);
     }
 
     WiFi.reconnect();
