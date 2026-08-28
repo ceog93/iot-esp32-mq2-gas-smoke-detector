@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
+#include <PubSubClient.h> // Librería para MQTT (Home Assistant)
 #include "secrets.h"
 
 // ==========================================
@@ -11,6 +12,17 @@ const int PIN_SENSOR_GAS = 34;          // Pin analógico (GPIO 34) conectado a 
 const int PIN_BUZZER = 25;              // Pin digital (GPIO 25) conectado al Buzzer local
 const int PIN_RELE = 26;                // Pin digital (GPIO 26) conectado al Módulo Relé de 5V (3 pines)
 // Nota el buzzer está alimentado a 3.3V 
+
+// ==========================================
+// CONFIGURACIÓN DE MQTT (HOME ASSISTANT)
+// ==========================================
+const int MQTT_PORT = 1883;
+const char* TOPIC_VALOR_GAS = "casa/cocina/gas/valor";
+const char* TOPIC_ESTADO_ALARMA = "casa/cocina/gas/alarma";
+
+WiFiClient espClient; // Cliente Wi-Fi normal (sin encriptar) para conexión local MQTT
+PubSubClient mqttClient(espClient);
+
 // ==========================================
 // UMBRALES Y CONFIGURACIÓN DE ALERTAS
 // ==========================================
@@ -47,6 +59,7 @@ bool enviarMensajeTelegram(String mensaje);
 String urlEncode(String str);
 void verificarEstabilizacion(int valorActual);
 void activarBuzzerAlarma();
+void conectarMQTT(); // Nuevo prototipo para manejar la conexión a Home Assistant
 
 void setup() {
   // Inicializar comunicación serial para depuración a 115200 baudios
@@ -99,6 +112,9 @@ void setup() {
     Serial.println(WiFi.localIP());
     Serial.printf("    Calidad señal (RSSI): %d dBm\n", WiFi.RSSI());
 
+    // Configurar el servidor MQTT con los datos de secrets.h
+    mqttClient.setServer(SECRET_MQTT_BROKER, MQTT_PORT);
+
     // 3 destellos rápidos de confirmación visual
     indicarConexionExitosa();
     
@@ -139,12 +155,24 @@ void loop() {
 
   // 3. Operación principal si hay red Wi-Fi disponible
   if (wifiConectado) {
+    
+    // Mantener la conexión con Mosquitto (Home Assistant)
+    if (!mqttClient.connected()) {
+      conectarMQTT();
+    }
+    mqttClient.loop(); // Permite a la librería MQTT procesar datos entrantes/salientes
+
     // Lectura analógica en crudo del sensor (0 a 4095)
     int valorCrudo = analogRead(PIN_SENSOR_GAS);
     // Conversión matemática opcional para estimar el voltaje en el pin AO
     float voltaje = valorCrudo * (3.3 / 4095.0);
 
     Serial.printf("[Sensor MQ-2] Crudo: %d  |  Voltaje: %.2f V", valorCrudo, voltaje);
+
+    // Enviar el valor numérico en tiempo real a Home Assistant
+    if (mqttClient.connected()) {
+      mqttClient.publish(TOPIC_VALOR_GAS, String(valorCrudo).c_str());
+    }
 
     // Bifurcación: Si el sensor aún no está listo, evaluamos su calentamiento
     if (!sensorEstabilizado) {
@@ -160,6 +188,11 @@ void loop() {
       // Evaluar si superamos el umbral de peligro configurado
       if (valorCrudo > UMBRAL_GAS) {
         
+        // Reportar emergencia a Home Assistant INMEDIATAMENTE
+        if (mqttClient.connected()) {
+          mqttClient.publish(TOPIC_ESTADO_ALARMA, "ON");
+        }
+
         // Activar relé INMEDIATAMENTE cambiando a OUTPUT y mandando señal LOW
         pinMode(PIN_RELE, OUTPUT);
         digitalWrite(PIN_RELE, LOW);
@@ -179,6 +212,11 @@ void loop() {
           Serial.println(" (En periodo de cooldown, alerta silenciada temporalmente)");
         }
       } else {
+        // Reportar estado normal a Home Assistant
+        if (mqttClient.connected()) {
+          mqttClient.publish(TOPIC_ESTADO_ALARMA, "OFF");
+        }
+
         digitalWrite(PIN_BUZZER, HIGH); // Asegurar buzzer apagado (HIGH) si los niveles son normales
         pinMode(PIN_RELE, INPUT);       // Forzar apagado real del relé pasándolo a Alta Impedancia
       }
@@ -202,6 +240,25 @@ void loop() {
 
     WiFi.reconnect();
     indicarErrorConexion();
+  }
+}
+
+// ==========================================
+// FUNCIÓN PARA CONECTAR Y RECONECTAR A MQTT
+// ==========================================
+void conectarMQTT() {
+  Serial.print(" [Conectando a MQTT...]");
+  // Crear un ID de cliente aleatorio para evitar conflictos
+  String clientId = "ESP32-Gas-";
+  clientId += String(random(0xffff), HEX);
+  
+  // Intentar conectar con las credenciales de secrets.h
+  if (mqttClient.connect(clientId.c_str(), SECRET_MQTT_USER, SECRET_MQTT_PASS)) {
+    Serial.print(" [MQTT ✅]");
+  } else {
+    Serial.print(" [MQTT ❌ Error ");
+    Serial.print(mqttClient.state());
+    Serial.print("]");
   }
 }
 
