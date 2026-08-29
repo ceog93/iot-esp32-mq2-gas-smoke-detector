@@ -13,6 +13,20 @@ const int PIN_BUZZER = 25;              // Pin digital (GPIO 25) conectado al Bu
 const int PIN_RELE = 26;                // Pin digital (GPIO 26) conectado al Módulo Relé de 5V (3 pines)
 // Nota el buzzer está alimentado a 3.3V 
 
+// Definición de pines para los LEDs del semáforo
+const int PIN_LED_ROJO = 33;            // Pin digital (GPIO 33) conectado al LED Rojo
+const int PIN_LED_AMARILLO = 32;        // Pin digital (GPIO 32) conectado al LED Amarillo
+const int PIN_LED_VERDE = 27;           // Pin digital (GPIO 27) conectado al LED Verde
+
+// Variables independientes de control de tiempo no bloqueante para cada patrón LED
+unsigned long tiempoUltimoParpadeoVerde = 0;
+unsigned long tiempoUltimoParpadeoAmarillo = 0;
+unsigned long tiempoUltimoParpadeoSirena = 0;
+
+bool estadoLedVerdeToggle = false;
+bool estadoLedAmarilloToggle = false;
+bool estadoSirenaLedToggle = false;
+
 // ==========================================
 // CONFIGURACIÓN DE MQTT (HOME ASSISTANT)
 // ==========================================
@@ -71,6 +85,16 @@ void setup() {
   digitalWrite(PIN_LED_BUILDIN, LOW);
   pinMode(PIN_SENSOR_GAS, INPUT);
   
+  // Configuración de los pines del semáforo LED como salidas
+  pinMode(PIN_LED_ROJO, OUTPUT);
+  pinMode(PIN_LED_AMARILLO, OUTPUT);
+  pinMode(PIN_LED_VERDE, OUTPUT);
+  
+  // Inicializar los LEDs apagados
+  digitalWrite(PIN_LED_ROJO, LOW);
+  digitalWrite(PIN_LED_AMARILLO, LOW);
+  digitalWrite(PIN_LED_VERDE, LOW);
+
   // Configuración del pin del Buzzer como salida y asegurarlo apagado (HIGH para módulos activos en LOW)
   pinMode(PIN_BUZZER, OUTPUT);
   digitalWrite(PIN_BUZZER, HIGH);
@@ -180,6 +204,16 @@ void loop() {
       verificarEstabilizacion(valorCrudo);
       digitalWrite(PIN_BUZZER, HIGH); // Mantener el buzzer apagado (HIGH) durante el arranque
       pinMode(PIN_RELE, INPUT);       // Mantener relé en alta impedancia (apagado) durante el arranque
+      
+      // Durante el calentamiento: LED amarillo intermitente rápido a 125 ms (8 parpadeos por segundo)
+      if (millis() - tiempoUltimoParpadeoAmarillo >= 125) {
+        tiempoUltimoParpadeoAmarillo = millis();
+        estadoLedAmarilloToggle = !estadoLedAmarilloToggle;
+      }
+      
+      digitalWrite(PIN_LED_AMARILLO, estadoLedAmarilloToggle ? HIGH : LOW);
+      digitalWrite(PIN_LED_VERDE, LOW);
+      digitalWrite(PIN_LED_ROJO, LOW);
     } 
     // Si ya está listo, pasamos a vigilar activamente la presencia de gas/humo
     else {
@@ -188,6 +222,21 @@ void loop() {
       // Evaluar si superamos el umbral de peligro configurado
       if (valorCrudo > UMBRAL_GAS) {
         
+        // Control visual de LEDs: Alerta detectada -> Amarillo y Rojo intermitentes intercalados muy rápido a 125 ms (8 cambios por segundo)
+        if (millis() - tiempoUltimoParpadeoSirena >= 125) { 
+          tiempoUltimoParpadeoSirena = millis();
+          estadoSirenaLedToggle = !estadoSirenaLedToggle;
+        }
+        
+        if (estadoSirenaLedToggle) {
+          digitalWrite(PIN_LED_ROJO, HIGH);
+          digitalWrite(PIN_LED_AMARILLO, LOW);
+        } else {
+          digitalWrite(PIN_LED_ROJO, LOW);
+          digitalWrite(PIN_LED_AMARILLO, HIGH);
+        }
+        digitalWrite(PIN_LED_VERDE, LOW); // Apagar verde en estado de alarma
+
         // Reportar emergencia a Home Assistant INMEDIATAMENTE
         if (mqttClient.connected()) {
           mqttClient.publish(TOPIC_ESTADO_ALARMA, "ON");
@@ -212,6 +261,16 @@ void loop() {
           Serial.println(" (En periodo de cooldown, alerta silenciada temporalmente)");
         }
       } else {
+        // Control visual de LEDs: Sin detección de gas y estabilizado -> LED verde intermitente como un beacon (1000ms)
+        if (millis() - tiempoUltimoParpadeoVerde >= 1000) { 
+          tiempoUltimoParpadeoVerde = millis();
+          estadoLedVerdeToggle = !estadoLedVerdeToggle;
+        }
+        
+        digitalWrite(PIN_LED_VERDE, estadoLedVerdeToggle ? HIGH : LOW);
+        digitalWrite(PIN_LED_AMARILLO, LOW);
+        digitalWrite(PIN_LED_ROJO, LOW);
+
         // Reportar estado normal a Home Assistant
         if (mqttClient.connected()) {
           mqttClient.publish(TOPIC_ESTADO_ALARMA, "OFF");
@@ -233,9 +292,27 @@ void loop() {
       pinMode(PIN_RELE, OUTPUT);
       digitalWrite(PIN_RELE, LOW);
       activarBuzzerAlarma();
+      
+      // Mantener efecto sirena ultrarrápido también sin red si hay gas (125 ms)
+      if (millis() - tiempoUltimoParpadeoSirena >= 125) {
+        tiempoUltimoParpadeoSirena = millis();
+        estadoSirenaLedToggle = !estadoSirenaLedToggle;
+      }
+      digitalWrite(PIN_LED_ROJO, estadoSirenaLedToggle ? HIGH : LOW);
+      digitalWrite(PIN_LED_AMARILLO, estadoSirenaLedToggle ? LOW : HIGH);
+      digitalWrite(PIN_LED_VERDE, LOW);
     } else {
       digitalWrite(PIN_BUZZER, HIGH);
       pinMode(PIN_RELE, INPUT);
+      
+      // Mantener beacon verde si no hay gas y hay conexión perdida pero ya operando
+      if (millis() - tiempoUltimoParpadeoVerde >= 1000) {
+        tiempoUltimoParpadeoVerde = millis();
+        estadoLedVerdeToggle = !estadoLedVerdeToggle;
+      }
+      digitalWrite(PIN_LED_VERDE, estadoLedVerdeToggle ? HIGH : LOW);
+      digitalWrite(PIN_LED_AMARILLO, LOW);
+      digitalWrite(PIN_LED_ROJO, LOW);
     }
 
     WiFi.reconnect();
