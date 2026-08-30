@@ -7,7 +7,7 @@
 // ==========================================
 // CONFIGURACIÓN DE PINES Y CONSTANTES
 // ==========================================
-const int PIN_LED_BUILDIN = 2;          // Pin del LED integrado en la placa ESP32
+const int PIN_LED_BUILDIN = 2;          // Pin del LED integrado en la placa ESP32 (Azul)
 const int PIN_SENSOR_GAS = 34;          // Pin analógico (GPIO 34) conectado a la salida AO del MQ-2
 const int PIN_BUZZER = 25;              // Pin digital (GPIO 25) conectado al Buzzer local
 const int PIN_RELE = 26;                // Pin digital (GPIO 26) conectado al Módulo Relé de 5V (3 pines)
@@ -23,6 +23,12 @@ unsigned long tiempoUltimoParpadeoVerde = 0;
 unsigned long tiempoUltimoParpadeoAmarillo = 0;
 unsigned long tiempoUltimoParpadeoSirena = 0;
 unsigned long tiempoUltimaLecturaSensor = 0; // Control no bloqueante para el ciclo de 2 segundos
+unsigned long tiempoUltimoReintentoWiFi = 0; // Control no bloqueante para la reconexión Wi-Fi
+
+// Variables para el control del LED azul (Wi-Fi)
+unsigned long tiempoUltimoParpadeoAzul = 0;
+unsigned long tiempoInicioLedIntento = 0;
+bool mostrandoLedIntento = false;
 
 bool estadoLedVerdeToggle = false;
 bool estadoLedAmarilloToggle = false;
@@ -48,6 +54,7 @@ const int UMBRAL_GAS = 1500;
 // Control de tiempo para evitar spam en Telegram (Cooldown en milisegundos)
 unsigned long ultimoEnvioTelegram = 0;
 const unsigned long COOLDOWN_TELEGRAM = 30000; // 30 segundos de espera mínima entre alertas repetidas
+const unsigned long INTERVALO_REINTENTO_WIFI = 10000; // 10 segundos entre cada intento de reconexión
 
 // ==========================================
 // VARIABLES PARA ESTABILIZACIÓN AUTOMÁTICA
@@ -68,98 +75,37 @@ bool estadoPrevioWiFI = false;          // Memoria del estado anterior para dete
 // ==========================================
 // PROTOTIPOS DE FUNCIONES
 // ==========================================
+void inicializarPines();
+void iniciarConexionWiFi();
 void indicarConexionExitosa();
-void indicarErrorConexion();
 bool enviarMensajeTelegram(String mensaje);
 String urlEncode(String str);
 void verificarEstabilizacion(int valorActual);
 void activarBuzzerAlarma();
-void conectarMQTT(); // Nuevo prototipo para manejar la conexión a Home Assistant
-void gestionarSistemaGas(int valorCrudo, bool hayRedWiFi); // Función unificada para evitar duplicidad
+void conectarMQTT(); 
+void gestionarSistemaGas(int valorCrudo, bool hayRedWiFi); 
 
-// Nuevas funciones auxiliares para evitar redundancia
+// Funciones auxiliares para evitar redundancia
 void configurarLEDs(bool rojo, bool amarillo, bool verde);
 void asegurarEstadoSeguro();
 void reportarEstadoMQTT(bool hayRedWiFi, const char* estado);
 void gestionarAlertaTelegram(bool hayRedWiFi);
+void imprimirLecturaSensor(int valorCrudo, const char* sufijo);
 
 void setup() {
   // Inicializar comunicación serial para depuración a 115200 baudios
   Serial.begin(115200);
   delay(1000);
 
-  // Configuración de pines físicos
-  pinMode(PIN_LED_BUILDIN, OUTPUT);
-  digitalWrite(PIN_LED_BUILDIN, LOW);
-  pinMode(PIN_SENSOR_GAS, INPUT);
-  
-  // Configuración de los pines del semáforo LED como salidas
-  pinMode(PIN_LED_ROJO, OUTPUT);
-  pinMode(PIN_LED_AMARILLO, OUTPUT);
-  pinMode(PIN_LED_VERDE, OUTPUT);
-  configurarLEDs(false, false, false); // Inicializar los LEDs apagados
-
-  // Configuración del pin del Buzzer como salida y asegurarlo apagado (HIGH para módulos activos en LOW)
-  pinMode(PIN_BUZZER, OUTPUT);
-  digitalWrite(PIN_BUZZER, HIGH);
-
-  // TRUCO PARA EL RELÉ DE 5V: En lugar de mandar HIGH (3.3V), 
-  // lo configuramos como INPUT (Alta Impedancia) para cortar la fuga de corriente y apagarlo de verdad en reposo.
-  pinMode(PIN_RELE, INPUT);
+  // Modularización: Inicializar todos los pines de hardware
+  inicializarPines();
 
   Serial.println("\n==========================================");
   Serial.println("   INICIANDO CONEXIÓN WI-FI + TELEGRAM    ");
   Serial.println("==========================================");
-  Serial.printf("Conectando a la red: %s\n", SECRET_WIFI_SSID);
-
-  // Configurar el ESP32 en modo estación (conecta a router Wi-Fi)
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(SECRET_WIFI_SSID, SECRET_WIFI_PASS);
-
-  int intentos = 0;
-  // Bucle de espera activa con parpadeo rápido en el LED mientras conecta al Wi-Fi
-  while (WiFi.status() != WL_CONNECTED && intentos < MAX_INTENTOS_WIFI) {
-    digitalWrite(PIN_LED_BUILDIN, HIGH);
-    delay(100);
-    digitalWrite(PIN_LED_BUILDIN, LOW);
-    delay(100);
-
-    Serial.print(".");
-    intentos++;
-  }
-
-  Serial.println("");
-
-  // Verificar si la conexión fue exitosa
-  if (WiFi.status() == WL_CONNECTED) {
-    wifiConectado = true;
-    estadoPrevioWiFI = true;
-    
-    Serial.println("\n[+] Conexión Wi-Fi establecida con éxito.");
-    Serial.print("    Dirección IP: ");
-    Serial.println(WiFi.localIP());
-    Serial.printf("    Calidad señal (RSSI): %d dBm\n", WiFi.RSSI());
-
-    // Configurar el servidor MQTT con los datos de secrets.h
-    mqttClient.setServer(SECRET_MQTT_BROKER, MQTT_PORT);
-
-    // 3 destellos rápidos de confirmación visual
-    indicarConexionExitosa();
-    
-    // Apagar el LED definitivamente tras la conexión exitosa
-    digitalWrite(PIN_LED_BUILDIN, LOW);
-
-    // Notificar al usuario vía Telegram que el sistema arrancó
-    enviarMensajeTelegram("🟢 *ESP32 Conectado*\nEl sistema se ha iniciado. Esperando a que el sensor MQ-2 se estabilice...");
-    
-    // Iniciar cronómetro de estabilización
-    tiempoInicioEstabilizacion = millis();
-  } else {
-    wifiConectado = false;
-    estadoPrevioWiFI = false;
-    Serial.println("\n[-] Error: No se pudo conectar a la red Wi-Fi.");
-    digitalWrite(PIN_LED_BUILDIN, LOW);
-  }
+  
+  // Modularización: Proceso de conexión a la red
+  iniciarConexionWiFi();
 }
 
 void loop() {
@@ -176,8 +122,9 @@ void loop() {
     Serial.println("[+] ¡Conexión Wi-Fi recuperada!");
     wifiConectado = true;
     estadoPrevioWiFI = true;
-    indicarConexionExitosa();
-    digitalWrite(PIN_LED_BUILDIN, LOW);
+    mostrandoLedIntento = false; // Cancelar estado de intento LED
+    indicarConexionExitosa();    // Confirmación visual
+    digitalWrite(PIN_LED_BUILDIN, LOW); // Apaga el LED azul
     enviarMensajeTelegram("🟢 *ESP32 Reconectado*\nLa conexión Wi-Fi se ha restablecido.");
   }
 
@@ -200,17 +147,102 @@ void loop() {
     // Ejecutar lógica central unificada indicando que SÍ hay red
     gestionarSistemaGas(valorCrudo, true);
   } 
-  // 4. Si NO hay Wi-Fi, ejecutar rutina de reconexión en segundo plano y lógica central de gas
+  // 4. Si NO hay Wi-Fi, ejecutar rutina de reconexión periódica y lógica central de gas
   else {
     gestionarSistemaGas(valorCrudo, false);
-    WiFi.reconnect();
-    indicarErrorConexion();
+
+    // ==============================================================
+    // CONTROL DEL LED AZUL SIN CONEXIÓN (Modo Offline / Reconectando)
+    // ==============================================================
+    if (mostrandoLedIntento) {
+      // Mantener el LED azul constante por 2.5 segundos tras el intento
+      digitalWrite(PIN_LED_BUILDIN, HIGH);
+      if (millis() - tiempoInicioLedIntento >= 2500) {
+        mostrandoLedIntento = false; // Termina el tiempo sólido, vuelve a parpadear
+      }
+    } else {
+      // Parpadeo rápido (100 ms) igual al inicio cuando no hay red
+      if (millis() - tiempoUltimoParpadeoAzul >= 100) {
+        tiempoUltimoParpadeoAzul = millis();
+        digitalWrite(PIN_LED_BUILDIN, !digitalRead(PIN_LED_BUILDIN));
+      }
+    }
+
+    // ==============================================================
+    // SISTEMA DE RECONEXIÓN NO BLOQUEANTE (Cada 10 segundos)
+    // ==============================================================
+    if (millis() - tiempoUltimoReintentoWiFi >= INTERVALO_REINTENTO_WIFI) {
+      tiempoUltimoReintentoWiFi = millis();
+      
+      // Activar bandera para poner el LED azul constante por 2.5 seg
+      tiempoInicioLedIntento = millis();
+      mostrandoLedIntento = true; 
+      
+      Serial.println("[Wi-Fi] Intentando reconectar a la red...");
+      WiFi.disconnect();
+      WiFi.reconnect();
+    }
   }
 }
 
 // ==========================================
 // FUNCIONES AUXILIARES PARA ELIMINAR REDUNDANCIA
 // ==========================================
+void inicializarPines() {
+  pinMode(PIN_LED_BUILDIN, OUTPUT);
+  digitalWrite(PIN_LED_BUILDIN, LOW);
+  pinMode(PIN_SENSOR_GAS, INPUT);
+  
+  pinMode(PIN_LED_ROJO, OUTPUT);
+  pinMode(PIN_LED_AMARILLO, OUTPUT);
+  pinMode(PIN_LED_VERDE, OUTPUT);
+  configurarLEDs(false, false, false); // Inicializar los LEDs apagados
+
+  pinMode(PIN_BUZZER, OUTPUT);
+  digitalWrite(PIN_BUZZER, HIGH); // Apagado por defecto
+  pinMode(PIN_RELE, INPUT);       // Alta impedancia para cortar fuga
+}
+
+void iniciarConexionWiFi() {
+  Serial.printf("Conectando a la red: %s\n", SECRET_WIFI_SSID);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(SECRET_WIFI_SSID, SECRET_WIFI_PASS);
+
+  int intentos = 0;
+  // Bucle de espera activa con parpadeo rápido en el LED mientras conecta al Wi-Fi (solo en Setup)
+  while (WiFi.status() != WL_CONNECTED && intentos < MAX_INTENTOS_WIFI) {
+    digitalWrite(PIN_LED_BUILDIN, HIGH);
+    delay(100);
+    digitalWrite(PIN_LED_BUILDIN, LOW);
+    delay(100);
+    Serial.print(".");
+    intentos++;
+  }
+  Serial.println("");
+
+  if (WiFi.status() == WL_CONNECTED) {
+    wifiConectado = true;
+    estadoPrevioWiFI = true;
+    
+    Serial.println("\n[+] Conexión Wi-Fi establecida con éxito.");
+    Serial.print("    Dirección IP: ");
+    Serial.println(WiFi.localIP());
+    Serial.printf("    Calidad señal (RSSI): %d dBm\n", WiFi.RSSI());
+
+    mqttClient.setServer(SECRET_MQTT_BROKER, MQTT_PORT);
+    indicarConexionExitosa();
+    digitalWrite(PIN_LED_BUILDIN, LOW);
+
+    enviarMensajeTelegram("🟢 *ESP32 Conectado*\nEl sistema se ha iniciado. Esperando a que el sensor MQ-2 se estabilice...");
+    tiempoInicioEstabilizacion = millis();
+  } else {
+    wifiConectado = false;
+    estadoPrevioWiFI = false;
+    Serial.println("\n[-] Error: No se pudo conectar a la red Wi-Fi. Iniciando en modo offline.");
+    digitalWrite(PIN_LED_BUILDIN, LOW);
+  }
+}
+
 void configurarLEDs(bool rojo, bool amarillo, bool verde) {
   digitalWrite(PIN_LED_ROJO, rojo ? HIGH : LOW);
   digitalWrite(PIN_LED_AMARILLO, amarillo ? HIGH : LOW);
@@ -242,6 +274,11 @@ void gestionarAlertaTelegram(bool hayRedWiFi) {
   }
 }
 
+void imprimirLecturaSensor(int valorCrudo, const char* sufijo) {
+  float voltaje = valorCrudo * (3.3 / 4095.0);
+  Serial.printf("[Sensor MQ-2] Crudo: %d  |  Voltaje: %.2f V%s\n", valorCrudo, voltaje, sufijo);
+}
+
 // ==========================================
 // FUNCIÓN UNIFICADA PARA GESTIÓN DE GAS Y ACTUADORES
 // ==========================================
@@ -252,14 +289,12 @@ void gestionarSistemaGas(int valorCrudo, bool hayRedWiFi) {
   if (millis() - tiempoUltimaLecturaSensor >= 2000) {
     tiempoUltimaLecturaSensor = millis();
     esMomentoDeReportar = true;
-    float voltaje = valorCrudo * (3.3 / 4095.0);
-    Serial.printf("[Sensor MQ-2] Crudo: %d  |  Voltaje: %.2f V", valorCrudo, voltaje);
   }
 
   // Bifurcación: Si el sensor aún no está listo, evaluamos su calentamiento
   if (!sensorEstabilizado) {
     if (esMomentoDeReportar) {
-      Serial.print(" [Calentando/Estabilizando...]\n");
+      imprimirLecturaSensor(valorCrudo, " [Calentando/Estabilizando...]");
       verificarEstabilizacion(valorCrudo);
     }
     
@@ -291,7 +326,7 @@ void gestionarSistemaGas(int valorCrudo, bool hayRedWiFi) {
       activarBuzzerAlarma();
 
       if (esMomentoDeReportar) {
-        Serial.print(" [Sensor Listo ✅]\n");
+        imprimirLecturaSensor(valorCrudo, " [Sensor Listo ✅]");
         gestionarAlertaTelegram(hayRedWiFi);
       }
     } else {
@@ -306,7 +341,7 @@ void gestionarSistemaGas(int valorCrudo, bool hayRedWiFi) {
       asegurarEstadoSeguro();
 
       if (esMomentoDeReportar) {
-        Serial.print(" [Sensor Listo ✅]\n");
+        imprimirLecturaSensor(valorCrudo, " [Sensor Listo ✅]");
       }
     }
   }
@@ -508,15 +543,4 @@ void indicarConexionExitosa() {
     digitalWrite(PIN_LED_BUILDIN, LOW);
     delay(150);
   }
-}
-
-void indicarErrorConexion() {
-  digitalWrite(PIN_LED_BUILDIN, HIGH);
-  delay(100);
-  digitalWrite(PIN_LED_BUILDIN, LOW);
-  delay(100);
-  digitalWrite(PIN_LED_BUILDIN, HIGH);
-  delay(100);
-  digitalWrite(PIN_LED_BUILDIN, LOW);
-  delay(800);
 }
