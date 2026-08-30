@@ -75,6 +75,13 @@ String urlEncode(String str);
 void verificarEstabilizacion(int valorActual);
 void activarBuzzerAlarma();
 void conectarMQTT(); // Nuevo prototipo para manejar la conexión a Home Assistant
+void gestionarSistemaGas(int valorCrudo, bool hayRedWiFi); // Función unificada para evitar duplicidad
+
+// Nuevas funciones auxiliares para evitar redundancia
+void configurarLEDs(bool rojo, bool amarillo, bool verde);
+void asegurarEstadoSeguro();
+void reportarEstadoMQTT(bool hayRedWiFi, const char* estado);
+void gestionarAlertaTelegram(bool hayRedWiFi);
 
 void setup() {
   // Inicializar comunicación serial para depuración a 115200 baudios
@@ -90,11 +97,7 @@ void setup() {
   pinMode(PIN_LED_ROJO, OUTPUT);
   pinMode(PIN_LED_AMARILLO, OUTPUT);
   pinMode(PIN_LED_VERDE, OUTPUT);
-  
-  // Inicializar los LEDs apagados
-  digitalWrite(PIN_LED_ROJO, LOW);
-  digitalWrite(PIN_LED_AMARILLO, LOW);
-  digitalWrite(PIN_LED_VERDE, LOW);
+  configurarLEDs(false, false, false); // Inicializar los LEDs apagados
 
   // Configuración del pin del Buzzer como salida y asegurarlo apagado (HIGH para módulos activos en LOW)
   pinMode(PIN_BUZZER, OUTPUT);
@@ -178,163 +181,134 @@ void loop() {
     enviarMensajeTelegram("🟢 *ESP32 Reconectado*\nLa conexión Wi-Fi se ha restablecido.");
   }
 
+  // Lectura analógica en crudo del sensor (0 a 4095)
+  int valorCrudo = analogRead(PIN_SENSOR_GAS);
+
   // 3. Operación principal si hay red Wi-Fi disponible
   if (wifiConectado) {
-    
     // Mantener la conexión con Mosquitto (Home Assistant)
     if (!mqttClient.connected()) {
       conectarMQTT();
     }
     mqttClient.loop(); // Permite a la librería MQTT procesar datos entrantes/salientes
 
-    // Lectura analógica en crudo del sensor (0 a 4095)
-    int valorCrudo = analogRead(PIN_SENSOR_GAS);
-
-    // Bifurcación: Si el sensor aún no está listo, evaluamos su calentamiento
-    if (!sensorEstabilizado) {
-      // Ejecutar la estabilización cada 2 segundos de forma no bloqueante
-      if (millis() - tiempoUltimaLecturaSensor >= 2000) {
-        tiempoUltimaLecturaSensor = millis();
-        float voltaje = valorCrudo * (3.3 / 4095.0);
-        Serial.printf("[Sensor MQ-2] Crudo: %d  |  Voltaje: %.2f V", valorCrudo, voltaje);
-        Serial.print(" [Calentando/Estabilizando...]\n");
-        verificarEstabilizacion(valorCrudo);
-      }
-      
-      digitalWrite(PIN_BUZZER, HIGH); // Mantener el buzzer apagado (HIGH) durante el arranque
-      pinMode(PIN_RELE, INPUT);       // Mantener relé en alta impedancia (apagado) durante el arranque
-      
-      // Durante el calentamiento: LED amarillo intermitente rápido a 125 ms (fluido sin bloqueos)
-      if (millis() - tiempoUltimoParpadeoAmarillo >= 125) {
-        tiempoUltimoParpadeoAmarillo = millis();
-        estadoLedAmarilloToggle = !estadoLedAmarilloToggle;
-      }
-      
-      digitalWrite(PIN_LED_AMARILLO, estadoLedAmarilloToggle ? HIGH : LOW);
-      digitalWrite(PIN_LED_VERDE, LOW);
-      digitalWrite(PIN_LED_ROJO, LOW);
-    } 
-    // Si ya está listo, pasamos a vigilar activamente la presencia de gas/humo
-    else {
-      Serial.print(" [Sensor Listo ✅]");
-      
-      // Evaluar si superamos el umbral de peligro configurado
-      if (valorCrudo > UMBRAL_GAS) {
-        
-        // Control visual de LEDs: Alerta detectada -> Amarillo y Rojo intermitentes intercalados muy rápido a 125 ms
-        if (millis() - tiempoUltimoParpadeoSirena >= 60) { 
-          tiempoUltimoParpadeoSirena = millis();
-          estadoSirenaLedToggle = !estadoSirenaLedToggle;
-        }
-        
-        if (estadoSirenaLedToggle) {
-          digitalWrite(PIN_LED_ROJO, HIGH);
-          digitalWrite(PIN_LED_AMARILLO, LOW);
-        } else {
-          digitalWrite(PIN_LED_ROJO, LOW);
-          digitalWrite(PIN_LED_AMARILLO, HIGH);
-        }
-        digitalWrite(PIN_LED_VERDE, LOW); // Apagar verde en estado de alarma
-
-        // Reportar emergencia a Home Assistant INMEDIATAMENTE
-        if (mqttClient.connected()) {
-          mqttClient.publish(TOPIC_ESTADO_ALARMA, "ON");
-        }
-
-        // Activar relé INMEDIATAMENTE cambiando a OUTPUT y mandando señal LOW
-        pinMode(PIN_RELE, OUTPUT);
-        digitalWrite(PIN_RELE, LOW);
-
-        // Activar sirena local de inmediato por hardware
-        activarBuzzerAlarma();
-
-        // Tareas periódicas de impresión y MQTT cada 2 segundos sin congelar los parpadeos
-        if (millis() - tiempoUltimaLecturaSensor >= 2000) {
-          tiempoUltimaLecturaSensor = millis();
-          float voltaje = valorCrudo * (3.3 / 4095.0);
-          Serial.printf("[Sensor MQ-2] Crudo: %d  |  Voltaje: %.2f V [Sensor Listo ✅]\n", valorCrudo, voltaje);
-          
-          if (mqttClient.connected()) {
-            mqttClient.publish(TOPIC_VALOR_GAS, String(valorCrudo).c_str());
-          }
-
-          // Verificar si ya transcurrió el tiempo de cooldown para evitar saturar Telegram
-          if (millis() - ultimoEnvioTelegram > COOLDOWN_TELEGRAM) {
-            Serial.println("[!] ¡Nivel de gas elevado detectado! Enviando alerta...");
-            bool enviado = enviarMensajeTelegram("🚨 *¡ALERTA DE GAS/HUMO!* \nSe ha detectado una concentración elevada de gas en el ambiente.");
-            
-            if (enviado) {
-              ultimoEnvioTelegram = millis(); // Actualizar marca de tiempo del último envío exitoso
-            }
-          } else {
-            Serial.println(" (En periodo de cooldown, alerta silenciada temporalmente)");
-          }
-        }
-      } else {
-        // Control visual de LEDs: Sin detección de gas y estabilizado -> LED verde intermitente como un beacon (1000ms)
-        if (millis() - tiempoUltimoParpadeoVerde >= 1000) { 
-          tiempoUltimoParpadeoVerde = millis();
-          estadoLedVerdeToggle = !estadoLedVerdeToggle;
-        }
-        
-        digitalWrite(PIN_LED_VERDE, estadoLedVerdeToggle ? HIGH : LOW);
-        digitalWrite(PIN_LED_AMARILLO, LOW);
-        digitalWrite(PIN_LED_ROJO, LOW);
-
-        // Reportar estado normal a Home Assistant
-        if (mqttClient.connected()) {
-          mqttClient.publish(TOPIC_ESTADO_ALARMA, "OFF");
-        }
-
-        digitalWrite(PIN_BUZZER, HIGH); // Asegurar buzzer apagado (HIGH) si los niveles son normales
-        pinMode(PIN_RELE, INPUT);       // Forzar apagado real del relé pasándolo a Alta Impedancia
-
-        // Publicación periódica cada 2 segundos de forma no bloqueante
-        if (millis() - tiempoUltimaLecturaSensor >= 2000) {
-          tiempoUltimaLecturaSensor = millis();
-          float voltaje = valorCrudo * (3.3 / 4095.0);
-          Serial.printf("[Sensor MQ-2] Crudo: %d  |  Voltaje: %.2f V [Sensor Listo ✅]\n", valorCrudo, voltaje);
-          
-          if (mqttClient.connected()) {
-            mqttClient.publish(TOPIC_VALOR_GAS, String(valorCrudo).c_str());
-          }
-        }
-      }
+    // Enviar el valor numérico en tiempo real a Home Assistant
+    if (mqttClient.connected()) {
+      mqttClient.publish(TOPIC_VALOR_GAS, String(valorCrudo).c_str());
     }
+
+    // Ejecutar lógica central unificada indicando que SÍ hay red
+    gestionarSistemaGas(valorCrudo, true);
   } 
-  // 4. Si NO hay Wi-Fi, ejecutar rutina de reconexión en segundo plano y parpadeo de error
+  // 4. Si NO hay Wi-Fi, ejecutar rutina de reconexión en segundo plano y lógica central de gas
   else {
-    // Si no hay red pero el sensor detecta gas, la sirena local y el relé deben actuar de todos modos
-    int valorCrudo = analogRead(PIN_SENSOR_GAS);
+    gestionarSistemaGas(valorCrudo, false);
+    WiFi.reconnect();
+    indicarErrorConexion();
+  }
+}
+
+// ==========================================
+// FUNCIONES AUXILIARES PARA ELIMINAR REDUNDANCIA
+// ==========================================
+void configurarLEDs(bool rojo, bool amarillo, bool verde) {
+  digitalWrite(PIN_LED_ROJO, rojo ? HIGH : LOW);
+  digitalWrite(PIN_LED_AMARILLO, amarillo ? HIGH : LOW);
+  digitalWrite(PIN_LED_VERDE, verde ? HIGH : LOW);
+}
+
+void asegurarEstadoSeguro() {
+  digitalWrite(PIN_BUZZER, HIGH); // Mantener el buzzer apagado (HIGH) 
+  pinMode(PIN_RELE, INPUT);       // Mantener relé en alta impedancia (apagado)
+}
+
+void reportarEstadoMQTT(bool hayRedWiFi, const char* estado) {
+  if (hayRedWiFi && mqttClient.connected()) {
+    mqttClient.publish(TOPIC_ESTADO_ALARMA, estado);
+  }
+}
+
+void gestionarAlertaTelegram(bool hayRedWiFi) {
+  if (hayRedWiFi) {
+    if (millis() - ultimoEnvioTelegram > COOLDOWN_TELEGRAM) {
+      Serial.println("[!] ¡Nivel de gas elevado detectado! Enviando alerta...");
+      bool enviado = enviarMensajeTelegram("🚨 *¡ALERTA DE GAS/HUMO!* \nSe ha detectado una concentración elevada de gas en el ambiente.");
+      if (enviado) {
+        ultimoEnvioTelegram = millis(); // Actualizar marca de tiempo del último envío exitoso
+      }
+    } else {
+      Serial.println(" (En periodo de cooldown, alerta silenciada temporalmente)");
+    }
+  }
+}
+
+// ==========================================
+// FUNCIÓN UNIFICADA PARA GESTIÓN DE GAS Y ACTUADORES
+// ==========================================
+void gestionarSistemaGas(int valorCrudo, bool hayRedWiFi) {
+  // Bandera para ejecutar tareas lentas/reportes solo cada 2 segundos sin bloquear el ciclo de LEDs
+  bool esMomentoDeReportar = false;
+
+  if (millis() - tiempoUltimaLecturaSensor >= 2000) {
+    tiempoUltimaLecturaSensor = millis();
+    esMomentoDeReportar = true;
+    float voltaje = valorCrudo * (3.3 / 4095.0);
+    Serial.printf("[Sensor MQ-2] Crudo: %d  |  Voltaje: %.2f V", valorCrudo, voltaje);
+  }
+
+  // Bifurcación: Si el sensor aún no está listo, evaluamos su calentamiento
+  if (!sensorEstabilizado) {
+    if (esMomentoDeReportar) {
+      Serial.print(" [Calentando/Estabilizando...]\n");
+      verificarEstabilizacion(valorCrudo);
+    }
+    
+    asegurarEstadoSeguro();
+    
+    // Durante el calentamiento: LED amarillo intermitente rápido a 125 ms (fluido sin bloqueos)
+    if (millis() - tiempoUltimoParpadeoAmarillo >= 125) {
+      tiempoUltimoParpadeoAmarillo = millis();
+      estadoLedAmarilloToggle = !estadoLedAmarilloToggle;
+    }
+    configurarLEDs(false, estadoLedAmarilloToggle, false);
+  } 
+  // Si ya está listo, pasamos a vigilar activamente la presencia de gas/humo
+  else {
+    // Evaluar si superamos el umbral de peligro configurado
     if (valorCrudo > UMBRAL_GAS) {
-      pinMode(PIN_RELE, OUTPUT);
-      digitalWrite(PIN_RELE, LOW);
-      activarBuzzerAlarma();
-      
-      // Mantener efecto sirena ultrarrápido también sin red si hay gas (125 ms)
-      if (millis() - tiempoUltimoParpadeoSirena >= 60) {
+      // Control visual de LEDs: Alerta detectada -> Amarillo y Rojo intermitentes intercalados muy rápido a 60 ms (sirena ultrarrápida)
+      if (millis() - tiempoUltimoParpadeoSirena >= 60) { 
         tiempoUltimoParpadeoSirena = millis();
         estadoSirenaLedToggle = !estadoSirenaLedToggle;
       }
-      digitalWrite(PIN_LED_ROJO, estadoSirenaLedToggle ? HIGH : LOW);
-      digitalWrite(PIN_LED_AMARILLO, estadoSirenaLedToggle ? LOW : HIGH);
-      digitalWrite(PIN_LED_VERDE, LOW);
-    } else {
-      digitalWrite(PIN_BUZZER, HIGH);
-      pinMode(PIN_RELE, INPUT);
+      configurarLEDs(estadoSirenaLedToggle, !estadoSirenaLedToggle, false);
       
-      // Mantener beacon verde si no hay gas y hay conexión perdida pero ya operando
-      if (millis() - tiempoUltimoParpadeoVerde >= 1000) {
+      reportarEstadoMQTT(hayRedWiFi, "ON");
+
+      // Activar relé y sirena local INMEDIATAMENTE
+      pinMode(PIN_RELE, OUTPUT);
+      digitalWrite(PIN_RELE, LOW);
+      activarBuzzerAlarma();
+
+      if (esMomentoDeReportar) {
+        Serial.print(" [Sensor Listo ✅]\n");
+        gestionarAlertaTelegram(hayRedWiFi);
+      }
+    } else {
+      // Control visual de LEDs: Sin detección de gas y estabilizado -> LED verde intermitente como un beacon (1000ms)
+      if (millis() - tiempoUltimoParpadeoVerde >= 1000) { 
         tiempoUltimoParpadeoVerde = millis();
         estadoLedVerdeToggle = !estadoLedVerdeToggle;
       }
-      digitalWrite(PIN_LED_VERDE, estadoLedVerdeToggle ? HIGH : LOW);
-      digitalWrite(PIN_LED_AMARILLO, LOW);
-      digitalWrite(PIN_LED_ROJO, LOW);
-    }
+      configurarLEDs(false, false, estadoLedVerdeToggle);
+      
+      reportarEstadoMQTT(hayRedWiFi, "OFF");
+      asegurarEstadoSeguro();
 
-    WiFi.reconnect();
-    indicarErrorConexion();
+      if (esMomentoDeReportar) {
+        Serial.print(" [Sensor Listo ✅]\n");
+      }
+    }
   }
 }
 
