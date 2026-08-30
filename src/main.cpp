@@ -18,10 +18,11 @@ const int PIN_LED_ROJO = 33;            // Pin digital (GPIO 33) conectado al LE
 const int PIN_LED_AMARILLO = 32;        // Pin digital (GPIO 32) conectado al LED Amarillo
 const int PIN_LED_VERDE = 27;           // Pin digital (GPIO 27) conectado al LED Verde
 
-// Variables independientes de control de tiempo no bloqueante para cada patrón LED
+// Variables independientes de control de tiempo no bloqueante para cada patrón LED y tareas
 unsigned long tiempoUltimoParpadeoVerde = 0;
 unsigned long tiempoUltimoParpadeoAmarillo = 0;
 unsigned long tiempoUltimoParpadeoSirena = 0;
+unsigned long tiempoUltimaLecturaSensor = 0; // Control no bloqueante para el ciclo de 2 segundos
 
 bool estadoLedVerdeToggle = false;
 bool estadoLedAmarilloToggle = false;
@@ -188,24 +189,22 @@ void loop() {
 
     // Lectura analógica en crudo del sensor (0 a 4095)
     int valorCrudo = analogRead(PIN_SENSOR_GAS);
-    // Conversión matemática opcional para estimar el voltaje en el pin AO
-    float voltaje = valorCrudo * (3.3 / 4095.0);
-
-    Serial.printf("[Sensor MQ-2] Crudo: %d  |  Voltaje: %.2f V", valorCrudo, voltaje);
-
-    // Enviar el valor numérico en tiempo real a Home Assistant
-    if (mqttClient.connected()) {
-      mqttClient.publish(TOPIC_VALOR_GAS, String(valorCrudo).c_str());
-    }
 
     // Bifurcación: Si el sensor aún no está listo, evaluamos su calentamiento
     if (!sensorEstabilizado) {
-      Serial.print(" [Calentando/Estabilizando...]");
-      verificarEstabilizacion(valorCrudo);
+      // Ejecutar la estabilización cada 2 segundos de forma no bloqueante
+      if (millis() - tiempoUltimaLecturaSensor >= 2000) {
+        tiempoUltimaLecturaSensor = millis();
+        float voltaje = valorCrudo * (3.3 / 4095.0);
+        Serial.printf("[Sensor MQ-2] Crudo: %d  |  Voltaje: %.2f V", valorCrudo, voltaje);
+        Serial.print(" [Calentando/Estabilizando...]\n");
+        verificarEstabilizacion(valorCrudo);
+      }
+      
       digitalWrite(PIN_BUZZER, HIGH); // Mantener el buzzer apagado (HIGH) durante el arranque
       pinMode(PIN_RELE, INPUT);       // Mantener relé en alta impedancia (apagado) durante el arranque
       
-      // Durante el calentamiento: LED amarillo intermitente rápido a 125 ms (8 parpadeos por segundo)
+      // Durante el calentamiento: LED amarillo intermitente rápido a 125 ms (fluido sin bloqueos)
       if (millis() - tiempoUltimoParpadeoAmarillo >= 125) {
         tiempoUltimoParpadeoAmarillo = millis();
         estadoLedAmarilloToggle = !estadoLedAmarilloToggle;
@@ -222,8 +221,8 @@ void loop() {
       // Evaluar si superamos el umbral de peligro configurado
       if (valorCrudo > UMBRAL_GAS) {
         
-        // Control visual de LEDs: Alerta detectada -> Amarillo y Rojo intermitentes intercalados muy rápido a 125 ms (8 cambios por segundo)
-        if (millis() - tiempoUltimoParpadeoSirena >= 125) { 
+        // Control visual de LEDs: Alerta detectada -> Amarillo y Rojo intermitentes intercalados muy rápido a 125 ms
+        if (millis() - tiempoUltimoParpadeoSirena >= 60) { 
           tiempoUltimoParpadeoSirena = millis();
           estadoSirenaLedToggle = !estadoSirenaLedToggle;
         }
@@ -249,16 +248,27 @@ void loop() {
         // Activar sirena local de inmediato por hardware
         activarBuzzerAlarma();
 
-        // Verificar si ya transcurrió el tiempo de cooldown para evitar saturar Telegram
-        if (millis() - ultimoEnvioTelegram > COOLDOWN_TELEGRAM) {
-          Serial.println("\n[!] ¡Nivel de gas elevado detectado! Enviando alerta...");
-          bool enviado = enviarMensajeTelegram("🚨 *¡ALERTA DE GAS/HUMO!* \nSe ha detectado una concentración elevada de gas en el ambiente.");
+        // Tareas periódicas de impresión y MQTT cada 2 segundos sin congelar los parpadeos
+        if (millis() - tiempoUltimaLecturaSensor >= 2000) {
+          tiempoUltimaLecturaSensor = millis();
+          float voltaje = valorCrudo * (3.3 / 4095.0);
+          Serial.printf("[Sensor MQ-2] Crudo: %d  |  Voltaje: %.2f V [Sensor Listo ✅]\n", valorCrudo, voltaje);
           
-          if (enviado) {
-            ultimoEnvioTelegram = millis(); // Actualizar marca de tiempo del último envío exitoso
+          if (mqttClient.connected()) {
+            mqttClient.publish(TOPIC_VALOR_GAS, String(valorCrudo).c_str());
           }
-        } else {
-          Serial.println(" (En periodo de cooldown, alerta silenciada temporalmente)");
+
+          // Verificar si ya transcurrió el tiempo de cooldown para evitar saturar Telegram
+          if (millis() - ultimoEnvioTelegram > COOLDOWN_TELEGRAM) {
+            Serial.println("[!] ¡Nivel de gas elevado detectado! Enviando alerta...");
+            bool enviado = enviarMensajeTelegram("🚨 *¡ALERTA DE GAS/HUMO!* \nSe ha detectado una concentración elevada de gas en el ambiente.");
+            
+            if (enviado) {
+              ultimoEnvioTelegram = millis(); // Actualizar marca de tiempo del último envío exitoso
+            }
+          } else {
+            Serial.println(" (En periodo de cooldown, alerta silenciada temporalmente)");
+          }
         }
       } else {
         // Control visual de LEDs: Sin detección de gas y estabilizado -> LED verde intermitente como un beacon (1000ms)
@@ -278,11 +288,19 @@ void loop() {
 
         digitalWrite(PIN_BUZZER, HIGH); // Asegurar buzzer apagado (HIGH) si los niveles son normales
         pinMode(PIN_RELE, INPUT);       // Forzar apagado real del relé pasándolo a Alta Impedancia
+
+        // Publicación periódica cada 2 segundos de forma no bloqueante
+        if (millis() - tiempoUltimaLecturaSensor >= 2000) {
+          tiempoUltimaLecturaSensor = millis();
+          float voltaje = valorCrudo * (3.3 / 4095.0);
+          Serial.printf("[Sensor MQ-2] Crudo: %d  |  Voltaje: %.2f V [Sensor Listo ✅]\n", valorCrudo, voltaje);
+          
+          if (mqttClient.connected()) {
+            mqttClient.publish(TOPIC_VALOR_GAS, String(valorCrudo).c_str());
+          }
+        }
       }
     }
-    Serial.println("");
-
-    delay(2000); // Pausa de 2 segundos entre cada ciclo de lectura
   } 
   // 4. Si NO hay Wi-Fi, ejecutar rutina de reconexión en segundo plano y parpadeo de error
   else {
@@ -294,7 +312,7 @@ void loop() {
       activarBuzzerAlarma();
       
       // Mantener efecto sirena ultrarrápido también sin red si hay gas (125 ms)
-      if (millis() - tiempoUltimoParpadeoSirena >= 125) {
+      if (millis() - tiempoUltimoParpadeoSirena >= 60) {
         tiempoUltimoParpadeoSirena = millis();
         estadoSirenaLedToggle = !estadoSirenaLedToggle;
       }
@@ -331,11 +349,11 @@ void conectarMQTT() {
   
   // Intentar conectar con las credenciales de secrets.h
   if (mqttClient.connect(clientId.c_str(), SECRET_MQTT_USER, SECRET_MQTT_PASS)) {
-    Serial.print(" [MQTT ✅]");
+    Serial.print(" [MQTT ✅]\n");
   } else {
     Serial.print(" [MQTT ❌ Error ");
     Serial.print(mqttClient.state());
-    Serial.print("]");
+    Serial.print("]\n");
   }
 }
 
@@ -363,7 +381,7 @@ void verificarEstabilizacion(int valorActual) {
     }
 
     int delta = maxVal - minVal; // Calcular la fluctuación máxima (delta)
-    Serial.printf(" (Variación en 20s: %d)", delta);
+    Serial.printf(" (Variación en 20s: %d)\n", delta);
 
     // =========================================================================
     // SELECCIÓN DE TOLERANCIA DE ESTABILIZACIÓN:
