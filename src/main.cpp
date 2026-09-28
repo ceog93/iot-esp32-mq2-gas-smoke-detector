@@ -44,6 +44,28 @@ const int MQTT_PORT = 1883;
 const char* TOPIC_VALOR_GAS = "casa/cocina/gas/valor";
 const char* TOPIC_ESTADO_ALARMA = "casa/cocina/gas/alarma";
 
+// Tópicos y Payloads para Auto-Discovery de Home Assistant
+const char* TOPIC_DISCOVERY_SENSOR = "homeassistant/sensor/esp32_gas/valor/config";
+const char* TOPIC_DISCOVERY_ALARMA = "homeassistant/binary_sensor/esp32_gas/alarma/config";
+
+const char* PAYLOAD_DISCOVERY_SENSOR = 
+  "{\"name\":\"Nivel de Gas\","
+  "\"unique_id\":\"esp32_gas_cocina_ppm\","
+  "\"state_topic\":\"casa/cocina/gas/valor\","
+  "\"unit_of_measurement\":\"ADC\","
+  "\"state_class\":\"measurement\","
+  "\"icon\":\"mdi:gas-cylinder\","
+  "\"device\":{\"identifiers\":[\"esp32_gas_001\"],\"name\":\"Sensor Gas Cocina\",\"model\":\"MQ-2 ESP32\",\"manufacturer\":\"Homelab\"}}";
+
+const char* PAYLOAD_DISCOVERY_ALARMA = 
+  "{\"name\":\"Alarma de Gas\","
+  "\"unique_id\":\"esp32_gas_cocina_alerta\","
+  "\"state_topic\":\"casa/cocina/gas/alarma\","
+  "\"payload_on\":\"ON\","
+  "\"payload_off\":\"OFF\","
+  "\"device_class\":\"gas\","
+  "\"device\":{\"identifiers\":[\"esp32_gas_001\"]}}";
+
 WiFiClient espClient; // Cliente Wi-Fi normal (sin encriptar) para conexión local MQTT
 PubSubClient mqttClient(espClient);
 
@@ -87,6 +109,7 @@ String urlEncode(String str);
 void verificarEstabilizacion(int valorActual);
 void activarBuzzerAlarma();
 void conectarMQTT(); 
+void enviarConfiguracionDiscovery();
 void gestionarSistemaGas(int valorCrudo, bool hayRedWiFi); 
 
 // Funciones auxiliares para evitar redundancia
@@ -103,6 +126,10 @@ void setup() {
 
   // Modularización: Inicializar todos los pines de hardware
   inicializarPines();
+
+  // Configuración inicial de la librería MQTT antes de cualquier tráfico de red
+  mqttClient.setServer(SECRET_MQTT_BROKER, MQTT_PORT);
+  mqttClient.setBufferSize(512); // Asignación limpia de memoria estática para discovery
 
   Serial.println("\n==========================================");
   Serial.println("   INICIANDO CONEXIÓN WI-FI + TELEGRAM    ");
@@ -259,7 +286,6 @@ void iniciarConexionWiFi() {
     Serial.println(WiFi.localIP());
     Serial.printf("    Calidad señal (RSSI): %d dBm\n", WiFi.RSSI());
 
-    mqttClient.setServer(SECRET_MQTT_BROKER, MQTT_PORT);
     indicarConexionExitosa();
     digitalWrite(PIN_LED_BUILDIN, LOW);
 
@@ -397,6 +423,16 @@ void gestionarSistemaGas(int valorCrudo, bool hayRedWiFi) {
 }
 
 // ==========================================
+// FUNCIÓN PARA ENVIAR AUTO-DISCOVERY A HOME ASSISTANT
+// ==========================================
+void enviarConfiguracionDiscovery() {
+  Serial.print(" [Registrando entidades en Home Assistant...]");
+  // El tercer parámetro 'true' retiene el mensaje en Mosquitto para que HA lo recuerde tras reinicios
+  mqttClient.publish(TOPIC_DISCOVERY_SENSOR, PAYLOAD_DISCOVERY_SENSOR, true);
+  mqttClient.publish(TOPIC_DISCOVERY_ALARMA, PAYLOAD_DISCOVERY_ALARMA, true);
+}
+
+// ==========================================
 // FUNCIÓN PARA CONECTAR Y RECONECTAR A MQTT
 // ==========================================
 void conectarMQTT() {
@@ -408,6 +444,7 @@ void conectarMQTT() {
   // Intentar conectar con las credenciales de secrets.h
   if (mqttClient.connect(clientId.c_str(), SECRET_MQTT_USER, SECRET_MQTT_PASS)) {
     Serial.print(" [MQTT ✅]\n");
+    enviarConfiguracionDiscovery(); // Enviar registro automático al broker
   } else {
     Serial.print(" [MQTT ❌ Error ");
     Serial.print(mqttClient.state());
