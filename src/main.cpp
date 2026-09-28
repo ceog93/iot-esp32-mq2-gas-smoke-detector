@@ -26,9 +26,12 @@ unsigned long tiempoUltimaLecturaSensor = 0; // Control no bloqueante para el ci
 unsigned long tiempoUltimoReintentoWiFi = 0; // Control no bloqueante para la reconexión Wi-Fi
 
 // Variables para el control del LED azul (Wi-Fi)
+unsigned long tiempoUltimoReintentoMQTT = 0; // NUEVO: Control no bloqueante para MQTT
 unsigned long tiempoUltimoParpadeoAzul = 0;
 unsigned long tiempoInicioLedIntento = 0;
 bool mostrandoLedIntento = false;
+unsigned long tiempoLatidoMQTT = 0;
+bool latidoMQTTActivo = false;
 
 bool estadoLedVerdeToggle = false;
 bool estadoLedAmarilloToggle = false;
@@ -55,6 +58,7 @@ const int UMBRAL_GAS = 1500;
 unsigned long ultimoEnvioTelegram = 0;
 const unsigned long COOLDOWN_TELEGRAM = 30000; // 30 segundos de espera mínima entre alertas repetidas
 const unsigned long INTERVALO_REINTENTO_WIFI = 10000; // 10 segundos entre cada intento de reconexión
+const unsigned long INTERVALO_REINTENTO_MQTT = 5000;  // 5 segundos entre reintentos MQTT
 
 // ==========================================
 // VARIABLES PARA ESTABILIZACIÓN AUTOMÁTICA
@@ -133,15 +137,41 @@ void loop() {
 
   // 3. Operación principal si hay red Wi-Fi disponible
   if (wifiConectado) {
-    // Mantener la conexión con Mosquitto (Home Assistant)
+    
+    // GESTIÓN VISUAL MQTT (LED AZUL)
     if (!mqttClient.connected()) {
-      conectarMQTT();
-    }
-    mqttClient.loop(); // Permite a la librería MQTT procesar datos entrantes/salientes
+      
+      // Error de MQTT: Doble destello cada 4 segundos
+      unsigned long t = millis() % 4000;
+      if (t < 150) digitalWrite(PIN_LED_BUILDIN, HIGH);
+      else if (t < 300) digitalWrite(PIN_LED_BUILDIN, LOW);
+      else if (t < 450) digitalWrite(PIN_LED_BUILDIN, HIGH);
+      else digitalWrite(PIN_LED_BUILDIN, LOW);
 
-    // Enviar el valor numérico en tiempo real a Home Assistant
-    if (mqttClient.connected()) {
-      mqttClient.publish(TOPIC_VALOR_GAS, String(valorCrudo).c_str());
+      // Reintento no bloqueante: Solo intenta conectar cada 5 segundos
+      if (millis() - tiempoUltimoReintentoMQTT >= INTERVALO_REINTENTO_MQTT) {
+        tiempoUltimoReintentoMQTT = millis();
+        
+        digitalWrite(PIN_LED_BUILDIN, LOW); // <--- SOLUCIÓN: Forzar apagado antes de que el procesador se congele buscando el servidor
+        conectarMQTT();
+      }
+
+    } else {
+      // Todo OK: Apagar el LED azul si el latido de 50ms ya terminó
+      if (latidoMQTTActivo && (millis() - tiempoLatidoMQTT >= 50)) {
+        digitalWrite(PIN_LED_BUILDIN, LOW);
+        latidoMQTTActivo = false;
+      }
+      mqttClient.loop(); // Permite a la librería MQTT procesar datos entrantes/salientes
+    }
+
+    // Enviar el valor numérico en tiempo real a Home Assistant (4 veces por segundo) para evitar flooding
+    static unsigned long tiempoUltimoPublishValor = 0;
+    if (millis() - tiempoUltimoPublishValor >= 250) {
+      tiempoUltimoPublishValor = millis();
+      if (mqttClient.connected()) {
+        mqttClient.publish(TOPIC_VALOR_GAS, String(valorCrudo).c_str());
+      }
     }
 
     // Ejecutar lógica central unificada indicando que SÍ hay red
@@ -255,8 +285,17 @@ void asegurarEstadoSeguro() {
 }
 
 void reportarEstadoMQTT(bool hayRedWiFi, const char* estado) {
-  if (hayRedWiFi && mqttClient.connected()) {
-    mqttClient.publish(TOPIC_ESTADO_ALARMA, estado);
+  // Lógica Anti-Saturación: Publica inmediatamente al cambiar el estado, 
+  // o refuerza el aviso cada 2 segundos como latido de seguridad.
+  static String ultimoEstadoReportado = "";
+  static unsigned long tiempoUltimoReporteEstado = 0;
+
+  if (ultimoEstadoReportado != estado || (millis() - tiempoUltimoReporteEstado >= 2000)) {
+    if (hayRedWiFi && mqttClient.connected()) {
+      mqttClient.publish(TOPIC_ESTADO_ALARMA, estado);
+      ultimoEstadoReportado = estado;
+      tiempoUltimoReporteEstado = millis();
+    }
   }
 }
 
@@ -289,6 +328,13 @@ void gestionarSistemaGas(int valorCrudo, bool hayRedWiFi) {
   if (millis() - tiempoUltimaLecturaSensor >= 2000) {
     tiempoUltimaLecturaSensor = millis();
     esMomentoDeReportar = true;
+    
+    // Disparar Latido Azul si hay red y Home Assistant está conectado
+    if (hayRedWiFi && mqttClient.connected()) {
+      digitalWrite(PIN_LED_BUILDIN, HIGH);
+      tiempoLatidoMQTT = millis();
+      latidoMQTTActivo = true;
+    }
   }
 
   // Bifurcación: Si el sensor aún no está listo, evaluamos su calentamiento
@@ -299,6 +345,9 @@ void gestionarSistemaGas(int valorCrudo, bool hayRedWiFi) {
     }
     
     asegurarEstadoSeguro();
+
+    // Reportar estado seguro a HA en paralelo al calentamiento
+    reportarEstadoMQTT(hayRedWiFi, "OFF"); 
     
     // Durante el calentamiento: LED amarillo intermitente rápido a 125 ms (fluido sin bloqueos)
     if (millis() - tiempoUltimoParpadeoAmarillo >= 125) {
