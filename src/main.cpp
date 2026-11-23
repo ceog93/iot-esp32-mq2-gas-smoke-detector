@@ -5,6 +5,14 @@
 #include "secrets.h"
 
 // ==========================================
+// IDENTIFICACIÓN DEL NODO (ESCALABILIDAD FOG)
+// ==========================================
+// Se Cambia estos 3 valores para cada nuevo ESP32 que se agregue a la red
+#define NODE_ID "cocina"                // Ubicación (usado para armar los tópicos MQTT)
+#define DEVICE_ID "esp32_gas_001"       // ID único del hardware para la base de datos de Home Assistant
+#define DEVICE_NAME "Sensor Gas Cocina" // Nombre amigable que se mostrará en el panel
+
+// ==========================================
 // CONFIGURACIÓN DE PINES Y CONSTANTES
 // ==========================================
 const int PIN_LED_BUILDIN = 2;          // Pin del LED integrado en la placa ESP32 (Azul)
@@ -41,30 +49,50 @@ bool estadoSirenaLedToggle = false;
 // CONFIGURACIÓN DE MQTT (HOME ASSISTANT)
 // ==========================================
 const int MQTT_PORT = 1883;
-const char* TOPIC_VALOR_GAS = "casa/cocina/gas/valor";
-const char* TOPIC_ESTADO_ALARMA = "casa/cocina/gas/alarma";
+
+// Concatenación automática de macros para generar los tópicos dinámicos
+const char* TOPIC_VALOR_GAS = "casa/" NODE_ID "/gas/valor";
+const char* TOPIC_ESTADO_ALARMA = "casa/" NODE_ID "/gas/alarma";
+const char* TOPIC_DISPONIBILIDAD = "casa/" NODE_ID "/gas/disponibilidad"; // Tópico para LWT (Last Will)
 
 // Tópicos y Payloads para Auto-Discovery de Home Assistant
-const char* TOPIC_DISCOVERY_SENSOR = "homeassistant/sensor/esp32_gas/valor/config";
-const char* TOPIC_DISCOVERY_ALARMA = "homeassistant/binary_sensor/esp32_gas/alarma/config";
+const char* TOPIC_DISCOVERY_SENSOR = "homeassistant/sensor/" DEVICE_ID "/valor/config";
+const char* TOPIC_DISCOVERY_ALARMA = "homeassistant/binary_sensor/" DEVICE_ID "/alarma/config";
+const char* TOPIC_DISCOVERY_ESTADO = "homeassistant/binary_sensor/" DEVICE_ID "/estado/config"; // Sensor de Conexión
 
 const char* PAYLOAD_DISCOVERY_SENSOR = 
   "{\"name\":\"Nivel de Gas\","
-  "\"unique_id\":\"esp32_gas_cocina_ppm\","
-  "\"state_topic\":\"casa/cocina/gas/valor\","
+  "\"unique_id\":\"" DEVICE_ID "_ppm\","
+  "\"state_topic\":\"casa/" NODE_ID "/gas/valor\","
+  "\"availability_topic\":\"casa/" NODE_ID "/gas/disponibilidad\","
+  "\"payload_available\":\"online\","
+  "\"payload_not_available\":\"offline\","
   "\"unit_of_measurement\":\"ADC\","
   "\"state_class\":\"measurement\","
   "\"icon\":\"mdi:gas-cylinder\","
-  "\"device\":{\"identifiers\":[\"esp32_gas_001\"],\"name\":\"Sensor Gas Cocina\",\"model\":\"MQ-2 ESP32\",\"manufacturer\":\"Homelab\"}}";
+  "\"device\":{\"identifiers\":[\"" DEVICE_ID "\"],\"name\":\"" DEVICE_NAME "\",\"model\":\"MQ-2 ESP32\",\"manufacturer\":\"Homelab\"}}";
 
 const char* PAYLOAD_DISCOVERY_ALARMA = 
   "{\"name\":\"Alarma de Gas\","
-  "\"unique_id\":\"esp32_gas_cocina_alerta\","
-  "\"state_topic\":\"casa/cocina/gas/alarma\","
+  "\"unique_id\":\"" DEVICE_ID "_alerta\","
+  "\"state_topic\":\"casa/" NODE_ID "/gas/alarma\","
+  "\"availability_topic\":\"casa/" NODE_ID "/gas/disponibilidad\","
+  "\"payload_available\":\"online\","
+  "\"payload_not_available\":\"offline\","
   "\"payload_on\":\"ON\","
   "\"payload_off\":\"OFF\","
   "\"device_class\":\"gas\","
-  "\"device\":{\"identifiers\":[\"esp32_gas_001\"]}}";
+  "\"device\":{\"identifiers\":[\"" DEVICE_ID "\"]}}";
+
+const char* PAYLOAD_DISCOVERY_ESTADO = 
+  "{\"name\":\"Conexión ESP32\","
+  "\"unique_id\":\"" DEVICE_ID "_conexion\","
+  "\"state_topic\":\"casa/" NODE_ID "/gas/disponibilidad\","
+  "\"payload_on\":\"online\","
+  "\"payload_off\":\"offline\","
+  "\"device_class\":\"connectivity\","
+  "\"entity_category\":\"diagnostic\","
+  "\"device\":{\"identifiers\":[\"" DEVICE_ID "\"]}}";
 
 WiFiClient espClient; // Cliente Wi-Fi normal (sin encriptar) para conexión local MQTT
 PubSubClient mqttClient(espClient);
@@ -129,7 +157,7 @@ void setup() {
 
   // Configuración inicial de la librería MQTT antes de cualquier tráfico de red
   mqttClient.setServer(SECRET_MQTT_BROKER, MQTT_PORT);
-  mqttClient.setBufferSize(512); // Asignación limpia de memoria estática para discovery
+  mqttClient.setBufferSize(1200); // Asignación limpia de memoria estática (Aumentado ligeramente para el 3er sensor)
 
   Serial.println("\n==========================================");
   Serial.println("   INICIANDO CONEXIÓN WI-FI + TELEGRAM    ");
@@ -430,6 +458,7 @@ void enviarConfiguracionDiscovery() {
   // El tercer parámetro 'true' retiene el mensaje en Mosquitto para que HA lo recuerde tras reinicios
   mqttClient.publish(TOPIC_DISCOVERY_SENSOR, PAYLOAD_DISCOVERY_SENSOR, true);
   mqttClient.publish(TOPIC_DISCOVERY_ALARMA, PAYLOAD_DISCOVERY_ALARMA, true);
+  mqttClient.publish(TOPIC_DISCOVERY_ESTADO, PAYLOAD_DISCOVERY_ESTADO, true);
 }
 
 // ==========================================
@@ -437,13 +466,17 @@ void enviarConfiguracionDiscovery() {
 // ==========================================
 void conectarMQTT() {
   Serial.print(" [Conectando a MQTT...]");
-  // Crear un ID de cliente aleatorio para evitar conflictos
-  String clientId = "ESP32-Gas-";
+  // Crear un ID de cliente aleatorio pero identificable en Mosquitto
+  String clientId = "ESP32-" + String(NODE_ID) + "-";
   clientId += String(random(0xffff), HEX);
   
-  // Intentar conectar con las credenciales de secrets.h
-  if (mqttClient.connect(clientId.c_str(), SECRET_MQTT_USER, SECRET_MQTT_PASS)) {
+  // Intentar conectar configurando LWT (tópico, QoS 0, retenido true, mensaje "offline")
+  if (mqttClient.connect(clientId.c_str(), SECRET_MQTT_USER, SECRET_MQTT_PASS, TOPIC_DISPONIBILIDAD, 0, true, "offline")) {
     Serial.print(" [MQTT ✅]\n");
+    
+    // Publicar inmediatamente que el dispositivo está online (retenido true)
+    mqttClient.publish(TOPIC_DISPONIBILIDAD, "online", true);
+    
     enviarConfiguracionDiscovery(); // Enviar registro automático al broker
   } else {
     Serial.print(" [MQTT ❌ Error ");

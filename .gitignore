@@ -6,3 +6,12 @@
 .vscode/ipch/
 # Credenciales y secretos privados
 include/secrets.h
+
+# --- Visual Studio Code ---
+.vscode/
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+
