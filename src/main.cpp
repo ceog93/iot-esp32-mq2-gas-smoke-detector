@@ -2,6 +2,7 @@
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <PubSubClient.h> // Librería para MQTT (Home Assistant)
+#include <ArduinoJson.h>  // Librería JSON (asegúrate de tener bblanchon/ArduinoJson en lib_deps)
 #include "secrets.h"
 
 // ==========================================
@@ -12,6 +13,10 @@
 #define DEVICE_ID "esp32_gas_001"       // ID único del hardware para la base de datos de Home Assistant
 #define DEVICE_NAME "Sensor Gas Cocina" // Nombre amigable que se mostrará en el panel
 
+// Identificación dentro del namespace de simulación (distinto a esp32-virtual-001..010)
+#define SIM_DEVICE_ID "esp32-fisico-001"
+#define SIM_UBICACION NODE_ID
+
 // ==========================================
 // CONFIGURACIÓN DE PINES Y CONSTANTES
 // ==========================================
@@ -19,6 +24,8 @@ const int PIN_LED_BUILDIN = 2;          // Pin del LED integrado en la placa ESP
 const int PIN_SENSOR_GAS = 34;          // Pin analógico (GPIO 34) conectado a la salida AO del MQ-2
 const int PIN_BUZZER = 25;              // Pin digital (GPIO 25) conectado al Buzzer local
 const int PIN_RELE = 26;                // Pin digital (GPIO 26) conectado al Módulo Relé de 5V (3 pines)
+const int PIN_VENTILADOR = 14;          // Pin digital (GPIO 14) conectado al Ventilador / driver de ventilación
+const bool VENTILADOR_ACTIVO_EN_BAJO = false; // true si activa con LOW, false si activa con HIGH
 // Nota el buzzer está alimentado a 3.3V 
 
 // Definición de pines para los LEDs del semáforo
@@ -45,6 +52,19 @@ bool estadoLedVerdeToggle = false;
 bool estadoLedAmarilloToggle = false;
 bool estadoSirenaLedToggle = false;
 
+// Variables para estado de simulación, alerta temprana, buzzer preventivo y ventilador
+bool alarmaPreventivaActiva = false;
+unsigned long ultimaAlertaTempranaRecibidaMs = 0;
+const unsigned long VIGENCIA_ALERTA_PREVENTIVA_MS = 3500; // Ventana activa mientras llegan alertas (ej. cada 1s)
+unsigned long ultimoPublishSimTelemetriaMs = 0;
+const unsigned long INTERVALO_SIM_TELEMETRIA_MS = 2000;  // Mismo ritmo de 2s que los nodos simulados
+
+// Ritmo no bloqueante para el buzzer en "alarma preventiva" (ej. pulso corto de 120ms cada 900ms)
+unsigned long tiempoUltimoPulsoPreventivo = 0;
+bool buzzerPreventivoEncendido = false;
+const unsigned long INTERVALO_BUZZER_PREVENTIVO_MS = 900;
+const unsigned long DURACION_PULSO_PREVENTIVO_MS = 120;
+
 // ==========================================
 // CONFIGURACIÓN DE MQTT (HOME ASSISTANT)
 // ==========================================
@@ -54,6 +74,11 @@ const int MQTT_PORT = 1883;
 const char* TOPIC_VALOR_GAS = "casa/" NODE_ID "/gas/valor";
 const char* TOPIC_ESTADO_ALARMA = "casa/" NODE_ID "/gas/alarma";
 const char* TOPIC_DISPONIBILIDAD = "casa/" NODE_ID "/gas/disponibilidad"; // Tópico para LWT (Last Will)
+
+// Tópicos para integración en simulacion/# (sin tocar casa/cocina/gas/...)
+const char* TOPIC_SIM_ESTADO = "simulacion/" SIM_DEVICE_ID "/estado";
+const char* TOPIC_SIM_TELEMETRIA = "simulacion/" SIM_DEVICE_ID "/telemetria";
+const char* TOPIC_SIM_ALERTA_TEMPRANA = "simulacion/alerta_temprana";
 
 // Tópicos y Payloads para Auto-Discovery de Home Assistant
 const char* TOPIC_DISCOVERY_SENSOR = "homeassistant/sensor/" DEVICE_ID "/valor/config";
@@ -139,6 +164,12 @@ void activarBuzzerAlarma();
 void conectarMQTT(); 
 void enviarConfiguracionDiscovery();
 void gestionarSistemaGas(int valorCrudo, bool hayRedWiFi); 
+void callbackMQTT(char* topic, byte* payload, unsigned int length);
+void actualizarAlarmaPreventiva();
+void publicarTelemetriaSimulacion(int valorCrudo, const char* estadoLectura);
+void configurarVentilador(bool encendido);
+void actualizarBuzzerPreventivo();
+void apagarBuzzerPreventivo();
 
 // Funciones auxiliares para evitar redundancia
 void configurarLEDs(bool rojo, bool amarillo, bool verde);
@@ -157,6 +188,7 @@ void setup() {
 
   // Configuración inicial de la librería MQTT antes de cualquier tráfico de red
   mqttClient.setServer(SECRET_MQTT_BROKER, MQTT_PORT);
+  mqttClient.setCallback(callbackMQTT);
   mqttClient.setBufferSize(1200); // Asignación limpia de memoria estática (Aumentado ligeramente para el 3er sensor)
 
   Serial.println("\n==========================================");
@@ -189,6 +221,9 @@ void loop() {
 
   // Lectura analógica en crudo del sensor (0 a 4095)
   int valorCrudo = analogRead(PIN_SENSOR_GAS);
+
+  // Evaluar si la ventana de "alarma preventiva" sigue vigente mientras llegan alertas tempranas
+  actualizarAlarmaPreventiva();
 
   // 3. Operación principal si hay red Wi-Fi disponible
   if (wifiConectado) {
@@ -271,6 +306,102 @@ void loop() {
 }
 
 // ==========================================
+// FUNCIONES DE INTEGRACIÓN CON SIMULACION/#
+// ==========================================
+void actualizarAlarmaPreventiva() {
+  if (alarmaPreventivaActiva && (millis() - ultimaAlertaTempranaRecibidaMs > VIGENCIA_ALERTA_PREVENTIVA_MS)) {
+    alarmaPreventivaActiva = false;
+    apagarBuzzerPreventivo();
+    Serial.println("[Simulación] Ventana de alerta temprana expirada -> volviendo a estado normal.");
+  }
+}
+
+void callbackMQTT(char* topic, byte* payload, unsigned int length) {
+  if (strcmp(topic, TOPIC_SIM_ALERTA_TEMPRANA) != 0) {
+    return;
+  }
+
+  // Copiar payload a String segura
+  String jsonStr;
+  jsonStr.reserve(length + 1);
+  for (unsigned int i = 0; i < length; i++) {
+    jsonStr += (char)payload[i];
+  }
+
+  // Extraer origen_device_id de forma ligera sin depender de librerías extra
+  int idxOrigen = jsonStr.indexOf("\"origen_device_id\"");
+  String origenId = "";
+  if (idxOrigen != -1) {
+    int colonIdx = jsonStr.indexOf(":", idxOrigen);
+    int firstQuote = jsonStr.indexOf("\"", colonIdx);
+    int secondQuote = jsonStr.indexOf("\"", firstQuote + 1);
+    if (firstQuote != -1 && secondQuote != -1) {
+      origenId = jsonStr.substring(firstQuote + 1, secondQuote);
+    }
+  }
+
+  // Ignorar alertas emitidas por este mismo nodo para evitar bucles
+  if (origenId == SIM_DEVICE_ID || origenId == DEVICE_ID) {
+    return;
+  }
+
+  // Mantener estado de lectura en "alarma preventiva" mientras se reciban alertas tempranas
+  // sin modificar el ADC real ni republicar en simulacion/alerta_temprana
+  alarmaPreventivaActiva = true;
+  ultimaAlertaTempranaRecibidaMs = millis();
+}
+
+void publicarTelemetriaSimulacion(int valorCrudo, const char* estadoLectura) {
+  if (!mqttClient.connected()) return;
+  if (millis() - ultimoPublishSimTelemetriaMs < INTERVALO_SIM_TELEMETRIA_MS) return;
+
+  ultimoPublishSimTelemetriaMs = millis();
+
+  // Timestamp relativo/ISO aproximado si no hay NTP sincronizado, o millis si prefieres
+  char payloadSim[256];
+  snprintf(
+    payloadSim,
+    sizeof(payloadSim),
+    "{\"device_id\":\"%s\",\"ubicacion\":\"%s\",\"adc\":%d,\"estado\":\"%s\",\"uptime_ms\":%lu,\"simulado\":false}",
+    SIM_DEVICE_ID,
+    SIM_UBICACION,
+    valorCrudo,
+    estadoLectura,
+    millis()
+  );
+
+  mqttClient.publish(TOPIC_SIM_TELEMETRIA, payloadSim);
+}
+
+void configurarVentilador(bool encendido) {
+  uint8_t nivel = encendido
+    ? (VENTILADOR_ACTIVO_EN_BAJO ? LOW : HIGH)
+    : (VENTILADOR_ACTIVO_EN_BAJO ? HIGH : LOW);
+  digitalWrite(PIN_VENTILADOR, nivel);
+}
+
+void apagarBuzzerPreventivo() {
+  buzzerPreventivoEncendido = false;
+  digitalWrite(PIN_BUZZER, HIGH); // Buzzer apagado (HIGH)
+}
+
+void actualizarBuzzerPreventivo() {
+  unsigned long ahora = millis();
+  if (!buzzerPreventivoEncendido) {
+    if (ahora - tiempoUltimoPulsoPreventivo >= INTERVALO_BUZZER_PREVENTIVO_MS) {
+      tiempoUltimoPulsoPreventivo = ahora;
+      buzzerPreventivoEncendido = true;
+      digitalWrite(PIN_BUZZER, LOW); // Pulso preventivo corto (activo en bajo)
+    }
+  } else {
+    if (ahora - tiempoUltimoPulsoPreventivo >= DURACION_PULSO_PREVENTIVO_MS) {
+      buzzerPreventivoEncendido = false;
+      digitalWrite(PIN_BUZZER, HIGH); // Apagar buzzer tras el pulso preventivo
+    }
+  }
+}
+
+// ==========================================
 // FUNCIONES AUXILIARES PARA ELIMINAR REDUNDANCIA
 // ==========================================
 void inicializarPines() {
@@ -286,6 +417,9 @@ void inicializarPines() {
   pinMode(PIN_BUZZER, OUTPUT);
   digitalWrite(PIN_BUZZER, HIGH); // Apagado por defecto
   pinMode(PIN_RELE, INPUT);       // Alta impedancia para cortar fuga
+
+  pinMode(PIN_VENTILADOR, OUTPUT);
+  configurarVentilador(false);    // Ventilador apagado por defecto
 }
 
 void iniciarConexionWiFi() {
@@ -399,9 +533,13 @@ void gestionarSistemaGas(int valorCrudo, bool hayRedWiFi) {
     }
     
     asegurarEstadoSeguro();
+    configurarVentilador(false);
 
     // Reportar estado seguro a HA en paralelo al calentamiento
     reportarEstadoMQTT(hayRedWiFi, "OFF"); 
+    if (hayRedWiFi) {
+      publicarTelemetriaSimulacion(valorCrudo, alarmaPreventivaActiva ? "alarma preventiva" : "normal");
+    }
     
     // Durante el calentamiento: LED amarillo intermitente rápido a 125 ms (fluido sin bloqueos)
     if (millis() - tiempoUltimoParpadeoAmarillo >= 125) {
@@ -414,6 +552,9 @@ void gestionarSistemaGas(int valorCrudo, bool hayRedWiFi) {
   else {
     // Evaluar si superamos el umbral de peligro configurado
     if (valorCrudo > UMBRAL_GAS) {
+      apagarBuzzerPreventivo();
+      configurarVentilador(true); // Encender ventilador en alarma propia
+
       // Control visual de LEDs: Alerta detectada -> Amarillo y Rojo intermitentes intercalados muy rápido a 60 ms (sirena ultrarrápida)
       if (millis() - tiempoUltimoParpadeoSirena >= 60) { 
         tiempoUltimoParpadeoSirena = millis();
@@ -422,6 +563,10 @@ void gestionarSistemaGas(int valorCrudo, bool hayRedWiFi) {
       configurarLEDs(estadoSirenaLedToggle, !estadoSirenaLedToggle, false);
       
       reportarEstadoMQTT(hayRedWiFi, "ON");
+      if (hayRedWiFi) {
+        // El nodo que supera el umbral mantiene su estado de lectura en "alarma"
+        publicarTelemetriaSimulacion(valorCrudo, "alarma");
+      }
 
       // Activar relé y sirena local INMEDIATAMENTE
       pinMode(PIN_RELE, OUTPUT);
@@ -433,18 +578,39 @@ void gestionarSistemaGas(int valorCrudo, bool hayRedWiFi) {
         gestionarAlertaTelegram(hayRedWiFi);
       }
     } else {
-      // Control visual de LEDs: Sin detección de gas y estabilizado -> LED verde intermitente como un beacon (1000ms)
-      if (millis() - tiempoUltimoParpadeoVerde >= 1000) { 
-        tiempoUltimoParpadeoVerde = millis();
-        estadoLedVerdeToggle = !estadoLedVerdeToggle;
+      // Sin detección propia: puede estar en "alarma preventiva" (si llegan alertas tempranas de otro nodo) o "normal"
+      const char* estadoSim = alarmaPreventivaActiva ? "alarma preventiva" : "normal";
+
+      if (alarmaPreventivaActiva) {
+        // Indicador preventivo: LED amarillo intermitente + pulso de buzzer suave + ventilador activo, sin activar relé de corte
+        if (millis() - tiempoUltimoParpadeoAmarillo >= 200) {
+          tiempoUltimoParpadeoAmarillo = millis();
+          estadoLedAmarilloToggle = !estadoLedAmarilloToggle;
+        }
+        configurarLEDs(false, estadoLedAmarilloToggle, false);
+        actualizarBuzzerPreventivo();
+        configurarVentilador(true);
+        digitalWrite(PIN_RELE, HIGH); // Asegura relé en reposo si se había configurado como salida
+        pinMode(PIN_RELE, INPUT);
+      } else {
+        // Control visual de LEDs: Sin detección de gas y estabilizado -> LED verde intermitente como un beacon (1000ms)
+        if (millis() - tiempoUltimoParpadeoVerde >= 1000) { 
+          tiempoUltimoParpadeoVerde = millis();
+          estadoLedVerdeToggle = !estadoLedVerdeToggle;
+        }
+        configurarLEDs(false, false, estadoLedVerdeToggle);
+        apagarBuzzerPreventivo();
+        configurarVentilador(false);
+        asegurarEstadoSeguro();
       }
-      configurarLEDs(false, false, estadoLedVerdeToggle);
       
       reportarEstadoMQTT(hayRedWiFi, "OFF");
-      asegurarEstadoSeguro();
+      if (hayRedWiFi) {
+        publicarTelemetriaSimulacion(valorCrudo, estadoSim);
+      }
 
       if (esMomentoDeReportar) {
-        imprimirLecturaSensor(valorCrudo, " [Sensor Listo ✅]");
+        imprimirLecturaSensor(valorCrudo, alarmaPreventivaActiva ? " [Sensor Listo ✅ | Alarma Preventiva ⚠️]" : " [Sensor Listo ✅]");
       }
     }
   }
@@ -476,6 +642,12 @@ void conectarMQTT() {
     
     // Publicar inmediatamente que el dispositivo está online (retenido true)
     mqttClient.publish(TOPIC_DISPONIBILIDAD, "online", true);
+
+    // Publicar disponibilidad retenida en simulacion/<SIM_DEVICE_ID>/estado ("conectado")
+    mqttClient.publish(TOPIC_SIM_ESTADO, "conectado", true);
+
+    // Suscribirse al topic de alerta temprana para reaccionar sin republicar en él
+    mqttClient.subscribe(TOPIC_SIM_ALERTA_TEMPRANA);
     
     enviarConfiguracionDiscovery(); // Enviar registro automático al broker
   } else {
